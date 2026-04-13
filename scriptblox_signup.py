@@ -13,9 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
-import eventlet
-eventlet.monkey_patch()
-
 import requests
 import urllib3
 urllib3.disable_warnings()
@@ -40,7 +37,7 @@ proxies_list = load_proxies()
 file_lock    = threading.Lock()
 
 app      = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 state = {
     "running": False,

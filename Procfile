@@ -1,1 +1,1 @@
-web: gunicorn -k eventlet -w 1 scriptblox_signup:app
+web: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --timeout 120 scriptblox_signup:app
