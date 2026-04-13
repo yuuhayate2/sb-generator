@@ -231,48 +231,76 @@ def run_generator(count, concurrent):
 @app.route("/verify-key", methods=["POST"])
 def verify():
 
-    global license_valid
+    global license_valid, current_key
 
-    data = request.json
-    key = data.get("key")
+    try:
+        data = request.json
+        key = data.get("key")
 
-    hwid = get_hwid(request.remote_addr)
+        if not key:
+            return jsonify({"valid": False})
 
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}"
-    }
+        hwid = get_hwid(request.remote_addr)
 
-    res = requests.get(
-        f"{SUPABASE_URL}/rest/v1/licenses",
-        headers=headers,
-        params={"license_key": f"eq.{key}"}
-    )
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        }
 
-    data = res.json()
-
-    if not data:
-        return jsonify({"valid": False})
-
-    license = data[0]
-
-    if license["status"] != "active":
-        return jsonify({"valid": False})
-
-    if license["hwid"] and license["hwid"] != hwid:
-        return jsonify({"valid": False})
-
-    if not license["hwid"]:
-        requests.patch(
+        res = requests.get(
             f"{SUPABASE_URL}/rest/v1/licenses",
             headers=headers,
-            params={"license_key": f"eq.{key}"},
-            json={"hwid": hwid}
+            params={
+                "license_key": f"eq.{key}",
+                "select": "*"
+            }
         )
 
-    license_valid = True
-    current_key = key
-    return jsonify({"valid": True})
+        if res.status_code != 200:
+            print("Supabase error:", res.text)
+            return jsonify({"valid": False})
+
+        result = res.json()
+
+        if not result:
+            return jsonify({"valid": False})
+
+        license = result[0]
+
+        # Check status
+        if license.get("status") != "active":
+            return jsonify({"valid": False})
+
+        # Check expiry
+        expiry_date = license.get("expiry_date")
+        if expiry_date:
+            expiry = datetime.fromisoformat(expiry_date.replace("Z", ""))
+            if datetime.now() > expiry:
+                return jsonify({"valid": False})
+
+        # Check HWID
+        if license.get("hwid") and license["hwid"] != hwid:
+            return jsonify({"valid": False})
+
+        # Bind HWID
+        if not license.get("hwid"):
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/licenses",
+                headers=headers,
+                params={"license_key": f"eq.{key}"},
+                json={"hwid": hwid}
+            )
+
+        license_valid = True
+        current_key = key
+
+        return jsonify({"valid": True})
+
+    except Exception as e:
+        print("VERIFY ERROR:", str(e))
+        return jsonify({"valid": False})
+
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
