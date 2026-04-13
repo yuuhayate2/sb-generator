@@ -1,6 +1,5 @@
 flask
 flask-socketio
-eventlet
 requests
 python-dotenv
 urllib3
