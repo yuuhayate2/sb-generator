@@ -607,20 +607,20 @@ function showLicenseScreen() {
             <div class="price-card">
               <div class="price-name">BASIC</div>
               <div class="price-limit">100 accounts</div>
-              <div class="price-amt">$79.99</div>
-              <div class="price-dur">100 Limit</div>
+              <div class="price-amt">₱XX</div>
+              <div class="price-dur">30 days</div>
             </div>
             <div class="price-card featured">
               <div class="price-name">PRO</div>
               <div class="price-limit">500 accounts</div>
-              <div class="price-amt">$349.99</div>
-              <div class="price-dur">500 Limit</div>
+              <div class="price-amt">₱XX</div>
+              <div class="price-dur">30 days</div>
             </div>
             <div class="price-card">
               <div class="price-name">UNLIMITED</div>
               <div class="price-limit">no limit</div>
-              <div class="price-amt">$499.99</div>
-              <div class="price-dur">60 days</div>
+              <div class="price-amt">₱XX</div>
+              <div class="price-dur">30 days</div>
             </div>
           </div>
           <div class="discord-section">
@@ -757,24 +757,9 @@ function showMainApp() {
         </div>
         <div class="tutorial-body" id="tutBody">
           <div class="video-container">
-            <div class="video-placeholder" id="videoPlaceholder">
-              <div class="video-placeholder-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              </div>
-              <div class="video-placeholder-text">tutorial video<br><span style="color:var(--muted2);font-size:9px">coming soon</span></div>
-            </div>
-            <!-- Replace the placeholder div above with this once you have a video URL:
-            <video class="video-el" controls controlsList="nodownload" oncontextmenu="return false" preload="metadata">
-              <source src="YOUR_VIDEO_URL_HERE" type="video/mp4">
-            </video>
-            -->
-          </div>
-          <div class="tutorial-steps">
-            <div class="step"><div class="step-num">1</div><div class="step-text">Go to <span>scriptblox.com</span> and click <span>Login</span> at the top right.</div></div>
-            <div class="step"><div class="step-num">2</div><div class="step-text">Open the generated accounts file <span>scriptblox_accounts.txt</span> — each line is one account in JSON format.</div></div>
-            <div class="step"><div class="step-num">3</div><div class="step-text">Copy a <span>username</span> and <span>password</span> from any line and paste them into the ScriptBlox login form.</div></div>
-            <div class="step"><div class="step-num">4</div><div class="step-text">Note: accounts are <span>unverified</span> — they work for uploading scripts but email verification may be required for some features.</div></div>
-            <div class="step"><div class="step-num">5</div><div class="step-text">If your Discord webhook is set, all accounts are also sent to your server automatically after generation.</div></div>
+            <iframe src="https://drive.google.com/file/d/1KgpnvPBwSzS75rAcTzDo8MIunPc9RVtM/preview" class="video-el" frameborder="0" allowfullscreen
+              allow="autoplay" style="position:absolute;inset:0;width:100%;height:100%;border:none;"
+              sandbox="allow-scripts allow-same-origin allow-presentation"></iframe>
           </div>
         </div>
       </div>
