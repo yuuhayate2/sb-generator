@@ -33,6 +33,7 @@ SUPABASE_URL = "https://ukwltgxtfikrpsqfihi.supabase.co"
 SUPABASE_KEY = "sb_publishable_NhI5Z-LriMN_huWOV14AtA_YtmDZeQ3"
 
 license_valid = False
+current_key = None
 
 def get_hwid(ip):
     return hashlib.sha256(ip.encode()).hexdigest()
@@ -272,7 +273,7 @@ def verify():
         )
 
     license_valid = True
-
+    current_key = key
     return jsonify({"valid": True})
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
