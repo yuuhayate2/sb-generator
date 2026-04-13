@@ -182,7 +182,7 @@ def create_account(slot):
         log_emit(f"[#{slot}] Setup failed (email/captcha)", "err")
         return
 
-    log_emit(f"[#{slot}] {email_addr} | Captcha OK", "dim")
+    log_emit(f"[#{slot}] preparing account...", "dim")
 
     try:
         r = requests.post(SB_SIGNUP, json={
@@ -212,7 +212,7 @@ def create_account(slot):
 
     send_webhook(username, password, email_addr)
     state["created"] += 1
-    log_emit(f"[#{slot}] ✓ {username}", "ok")
+    log_emit(f"[#{slot}] ✓ {username} | {password}", "ok")
 
 def run_generator(count, concurrent):
     sem = threading.Semaphore(concurrent)
@@ -261,6 +261,7 @@ def verify():
             "plan":  "Unlimited" if limit >= 9999 else f"{limit} accounts",
             "used":  used, "limit": limit,
             "accounts_left": None if limit >= 9999 else (limit - used),
+            "is_trial": rec.get("is_trial", False),
         })
     except Exception as e:
         print("VERIFY ERROR:", e)
@@ -370,8 +371,8 @@ HTML = r"""<!DOCTYPE html>
   ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
 
   /* ── LICENSE SCREEN ── */
-  .lic-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: radial-gradient(ellipse 60% 40% at 50% 0%, rgba(0,212,255,0.06) 0%, transparent 70%), var(--bg); }
-  .lic-card { width: 100%; max-width: 420px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 40px 36px 32px; position: relative; overflow: hidden; }
+  .lic-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; background: radial-gradient(ellipse 60% 40% at 50% 0%, rgba(0,212,255,0.06) 0%, transparent 70%), var(--bg); }
+  .lic-card { width: 100%; max-width: 480px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 36px 28px 28px; position: relative; overflow: hidden; }
   .lic-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--cyan), transparent); }
   .lic-logo { font-family: var(--sans); font-size: 36px; font-weight: 800; color: var(--cyan); letter-spacing: 6px; margin-bottom: 4px; }
   .lic-sub { font-size: 10px; letter-spacing: 3px; color: var(--muted); margin-bottom: 32px; }
@@ -385,25 +386,33 @@ HTML = r"""<!DOCTYPE html>
   .lic-err { font-size: 11px; min-height: 18px; margin-top: 10px; text-align: center; letter-spacing: .5px; color: var(--red); }
 
   /* pricelist */
-  .price-section { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--border); }
+  .price-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--border); }
   .price-title { font-size: 9px; letter-spacing: 3px; color: var(--muted); margin-bottom: 12px; text-align: center; }
-  .price-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; }
-  .price-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 8px; text-align: center; transition: border-color .2s; }
+  .price-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; min-width: 0; }
+  .price-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 6px; text-align: center; transition: border-color .2s; min-width: 0; overflow: hidden; }
   .price-card:hover { border-color: var(--border2); }
   .price-card.featured { border-color: rgba(0,212,255,.3); background: var(--cyan-dim); }
-  .price-name { font-family: var(--sans); font-size: 11px; font-weight: 700; color: var(--text); letter-spacing: 1px; margin-bottom: 4px; }
+  .price-name { font-family: var(--sans); font-size: 10px; font-weight: 700; color: var(--text); letter-spacing: 1px; margin-bottom: 4px; }
   .price-limit { font-size: 9px; color: var(--muted); letter-spacing: 1px; margin-bottom: 8px; }
-  .price-amt { font-family: var(--sans); font-size: 18px; font-weight: 800; color: var(--cyan); }
+  .price-amt { font-family: var(--sans); font-size: 15px; font-weight: 800; color: var(--cyan); white-space: nowrap; }
   .price-dur { font-size: 8px; color: var(--muted); letter-spacing: 1px; margin-top: 2px; }
   .price-card.featured .price-amt { color: var(--green); }
 
   /* discord contact */
   .discord-section { text-align: center; }
   .discord-label { font-size: 10px; color: var(--muted); letter-spacing: 1.5px; margin-bottom: 10px; }
-  .discord-btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 22px; background: rgba(114,137,218,.1); border: 1px solid rgba(114,137,218,.4); border-radius: 8px; color: var(--purple); font-family: var(--mono); font-size: 11px; letter-spacing: 1px; text-decoration: none; transition: all .2s; }
+  .discord-btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 11px 22px; background: rgba(114,137,218,.1); border: 1px solid rgba(114,137,218,.4); border-radius: 8px; color: var(--purple); font-family: var(--mono); font-size: 12px; letter-spacing: 1px; text-decoration: none; transition: all .2s; width: 100%; }
   .discord-btn:hover { background: rgba(114,137,218,.2); border-color: var(--purple); color: #fff; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(114,137,218,.3); }
   .discord-btn strong { color: #fff; }
-  .lic-footer { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .trial-divider { display: flex; align-items: center; gap: 10px; margin: 14px 0; }
+  .trial-divider::before, .trial-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .trial-divider span { font-size: 9px; color: var(--muted); letter-spacing: 2px; }
+  .trial-btn { width: 100%; padding: 11px; background: transparent; border: 1px dashed var(--border2); border-radius: var(--radius); color: var(--muted); font-family: var(--sans); font-weight: 700; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; cursor: pointer; transition: all .2s; margin-bottom: 4px; }
+  .trial-btn:hover { border-color: var(--green); color: var(--green); background: rgba(0,232,122,.05); }
+  .trial-btn.loading { opacity: .6; pointer-events: none; }
+  .trial-note { font-size: 9px; color: var(--muted2); text-align: center; letter-spacing: 1px; margin-bottom: 16px; }
+  .trial-badge { display: inline-block; font-size: 9px; letter-spacing: 1.5px; padding: 2px 9px; border-radius: 20px; font-weight: 700; border: 1px solid rgba(0,232,122,.4); color: var(--green); background: rgba(0,232,122,.08); margin-left: 6px; }
+    .lic-footer { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
   .lic-dot { width: 6px; height: 6px; background: var(--muted2); border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; transition: background .3s; }
   .lic-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse-dot 1.4s infinite; }
 
@@ -538,6 +547,45 @@ const ERR_MAP = {
   server_error:  'server error — try again later',
 };
 
+// ── TRIAL ────────────────────────────────────────────────────────────────────
+async function claimTrial() {
+  const btn = document.getElementById('trialBtn');
+  const err = document.getElementById('licErr');
+  btn.classList.add('loading'); btn.textContent = 'Claiming...';
+  err.textContent = ''; err.style.color = 'var(--muted)';
+  try {
+    const r = await fetch('/claim-trial', {method:'POST', headers:{'Content-Type':'application/json'}});
+    const d = await r.json();
+    if (d.ok) {
+      // Auto-fill and verify the trial key
+      err.style.color = 'var(--green)'; err.textContent = 'trial key claimed! verifying...';
+      const input = document.getElementById('licInput');
+      if (input) { input.value = d.key; }
+      // Auto verify
+      setTimeout(async () => {
+        const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:d.key})});
+        const vd = await vr.json();
+        if (vd.valid) {
+          localStorage.setItem('license', d.key);
+          licenseInfo = vd;
+          showMainApp();
+        }
+      }, 800);
+    } else if (d.error === 'already_claimed') {
+      err.style.color = 'var(--gold)';
+      err.textContent = 'device already has a trial — enter your key above';
+      if (document.getElementById('licInput')) document.getElementById('licInput').value = d.key;
+      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 5 accounts';
+    } else {
+      err.style.color = 'var(--red)'; err.textContent = 'failed to claim trial — try again';
+      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 5 accounts';
+    }
+  } catch {
+    err.style.color = 'var(--red)'; err.textContent = 'server error — try again';
+    btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 5 accounts';
+  }
+}
+
 // ── LICENSE SCREEN ───────────────────────────────────────────────────────────
 function showLicenseScreen() {
   document.getElementById('app').innerHTML = `
@@ -550,33 +598,37 @@ function showLicenseScreen() {
         <button class="lic-btn" id="licBtn" onclick="doLogin()">Verify License</button>
         <div class="lic-err" id="licErr"></div>
 
+        <div class="trial-divider"><span>OR</span></div>
+        <button class="trial-btn" id="trialBtn" onclick="claimTrial()">🎁 Get Free Trial — 5 accounts</button>
+        <div class="trial-note">1 free trial per device · 30 days · HWID locked</div>
+
         <div class="price-section">
           <div class="price-title">PRICING</div>
           <div class="price-grid">
             <div class="price-card">
               <div class="price-name">BASIC</div>
               <div class="price-limit">100 accounts</div>
-              <div class="price-amt">$79.99</div>
+              <div class="price-amt">₱XX</div>
               <div class="price-dur">30 days</div>
             </div>
             <div class="price-card featured">
               <div class="price-name">PRO</div>
               <div class="price-limit">500 accounts</div>
-              <div class="price-amt">$399.99</div>
-              <div class="price-dur">One Time Used</div>
+              <div class="price-amt">₱XX</div>
+              <div class="price-dur">30 days</div>
             </div>
             <div class="price-card">
               <div class="price-name">UNLIMITED</div>
               <div class="price-limit">no limit</div>
-              <div class="price-amt">$499.99</div>
-              <div class="price-dur">30 Days</div>
+              <div class="price-amt">₱XX</div>
+              <div class="price-dur">30 days</div>
             </div>
           </div>
           <div class="discord-section">
-            <div class="discord-label">want a license?</div>
-            <a class="discord-btn" href="https://discord.com/users/1482325142104178708" target="_blank">
+            <div class="discord-label">join our server to purchase</div>
+            <a class="discord-btn" href="https://discord.gg/Qvy4BSGJvC" target="_blank">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03z"/></svg>
-              DM <strong>Kuni</strong> to purchase
+              Join <strong>Kuni Server</strong>
             </a>
           </div>
         </div>
@@ -629,7 +681,7 @@ function showMainApp() {
       <div class="hdr">
         <div><div class="hdr-logo">KUNI</div><div class="hdr-sub">AUTO SB GEN</div></div>
         <div class="hdr-right">
-          <span class="plan-badge" id="planBadge">${planLabel}</span>
+          <span class="plan-badge" id="planBadge">${planLabel}</span>${licenseInfo && licenseInfo.is_trial ? '<span class="trial-badge">TRIAL</span>' : ''}
           <div class="hdr-ver">v2.4</div>
         </div>
       </div>
@@ -714,7 +766,7 @@ function showMainApp() {
             </div>
             <!-- Replace the placeholder div above with this once you have a video URL:
             <video class="video-el" controls controlsList="nodownload" oncontextmenu="return false" preload="metadata">
-              <source src="https://drive.google.com/file/d/1KgpnvPBwSzS75rAcTzDo8MIunPc9RVtM/view" type="video/mp4">
+              <source src="YOUR_VIDEO_URL_HERE" type="video/mp4">
             </video>
             -->
           </div>
@@ -925,6 +977,49 @@ if (savedKey) {
 </body>
 </html>
 """
+
+
+@app.route("/claim-trial", methods=["POST"])
+def claim_trial():
+    try:
+        hwid = get_hwid(request.remote_addr)
+
+        # Check if this HWID already has a trial
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                         params={"hwid": f"eq.{hwid}", "is_trial": "eq.true", "select": "id,license_key"})
+        if r.status_code == 200 and r.json():
+            existing = r.json()[0]
+            return jsonify({"ok": False, "error": "already_claimed",
+                            "key": existing["license_key"]})
+
+        # Generate trial key
+        def seg(): return __import__('random').choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6)
+        key = "TRIAL-" + "".join(seg()) + "-" + "".join(seg()) + "-" + "".join(seg())
+
+        # 30 day expiry
+        from datetime import timedelta
+        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+        body = {
+            "license_key":    key,
+            "accounts_limit": 5,
+            "accounts_used":  0,
+            "expiry_date":    expiry,
+            "status":         "active",
+            "is_trial":       True,
+            "hwid":           hwid,   # bind HWID immediately
+            "note":           "free trial",
+        }
+        r2 = requests.post(f"{SUPABASE_URL}/rest/v1/licenses",
+                           headers={**supa_hdrs(), "Prefer": "return=representation"},
+                           json=body)
+        if r2.status_code not in (200, 201):
+            return jsonify({"ok": False, "error": "db_error"})
+
+        return jsonify({"ok": True, "key": key})
+    except Exception as e:
+        print("TRIAL ERROR:", e)
+        return jsonify({"ok": False, "error": "server_error"})
 
 @app.route("/")
 def index():
