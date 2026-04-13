@@ -297,8 +297,7 @@ def set_webhook():
 @app.route("/get-proxies", methods=["GET"])
 def get_proxies():
     if not license_valid: return jsonify({"ok": False})
-    return jsonify({"ok": True, "count": len(proxies_list),
-                    "proxies": PROXIES_FILE.read_text() if PROXIES_FILE.exists() else ""})
+    return jsonify({"ok": True, "count": len(proxies_list)})
 
 @app.route("/get-webhook", methods=["GET"])
 def get_webhook():
@@ -725,7 +724,7 @@ function showMainApp() {
               <span class="badge" id="proxyBadge">loading...</span>
             </div>
             <div class="panel-inner" id="proxyPanel">
-              <textarea class="panel-textarea" id="proxyTA" placeholder="paste proxies — one per line&#10;host:port, host:port:user:pass, http://user:pass@host:port"></textarea>
+              <textarea class="panel-textarea" id="proxyTA" placeholder="paste proxies here — clears after save for security&#10;host:port, host:port:user:pass, http://user:pass@host:port"></textarea>
               <div class="panel-actions">
                 <button class="panel-btn" onclick="saveProxies()">SAVE</button>
                 <span class="panel-status" id="proxySt"></span>
@@ -817,15 +816,14 @@ function toggleTutorial() {
 }
 
 async function loadSavedConfig() {
-  // Load proxies
+  // Load proxies count only - never show actual proxy content
   try {
     const r = await fetch('/get-proxies');
     const d = await r.json();
     if (d.ok) {
       const badge = document.getElementById('proxyBadge');
-      badge.textContent = d.count + ' loaded';
+      badge.textContent = d.count > 0 ? d.count + ' loaded' : 'none';
       badge.className = 'badge' + (d.count > 0 ? ' ok' : '');
-      if (d.proxies) document.getElementById('proxyTA').value = d.proxies;
     }
   } catch {}
   // Load webhook
@@ -844,9 +842,11 @@ async function saveProxies() {
     const r = await fetch('/set-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxies:text})});
     const d = await r.json();
     if (d.ok) {
-      st.style.color='var(--green)'; st.textContent=d.count+' proxies saved';
+      st.style.color='var(--green)'; st.textContent=d.count+' proxies saved ✓';
+      document.getElementById('proxyTA').value = ''; // clear after save — never store visible
       const badge = document.getElementById('proxyBadge');
       badge.textContent = d.count+' loaded'; badge.className='badge'+(d.count>0?' ok':'');
+      setTimeout(() => togglePanel('proxyPanel'), 800); // auto-close panel after save
     } else { st.style.color='var(--red)'; st.textContent=d.error||'error'; }
   } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
