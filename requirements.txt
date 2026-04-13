@@ -1,8 +1,9 @@
 flask
 flask-socketio
-gevent
-gevent-websocket
+eventlet
 requests
 python-dotenv
-gunicorn
 urllib3
+gunicorn
+gevent
+gevent-websocket
