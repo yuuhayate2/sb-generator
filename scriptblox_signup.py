@@ -104,26 +104,139 @@ def mw_get_email(cookies, csrf):
             pass
     return None, csrf
 
-# ── Discord Webhook ───────────────────────────────────────────────────────────
-def send_webhook(username, password, email):
-    if not active_webhook: return
+# ── MailWave inbox polling ────────────────────────────────────────────────────
+def mw_poll_inbox(cookies, csrf, timeout=90):
+    """Poll MailWave inbox until verification email arrives. Returns verify URL or None."""
+    deadline = __import__('time').time() + timeout
+    while __import__('time').time() < deadline:
+        try:
+            tok = unquote(cookies.get("XSRF-TOKEN", csrf))
+            r = requests.post(f"{MW_BASE}/get_messages",
+                headers={"Content-Type": "application/json", "X-CSRF-TOKEN": tok},
+                cookies=cookies, proxies=NO_PROXY, timeout=15)
+            data = r.json()
+            messages = data.get("messages", [])
+            for msg in messages:
+                body = msg.get("body", "") + msg.get("html", "")
+                # Find verification link
+                match = re.search(r"https://scriptblox\.com/[\w/?=&%+\-_.]+verify[\w/?=&%+\-_.]+", body)
+                if match:
+                    return match.group(0)
+                # Also try token-only
+                match2 = re.search(r'[?&]token=([A-Za-z0-9_\-]+)', body)
+                if match2:
+                    return f"https://scriptblox.com/api/auth/verify-email?token={match2.group(1)}"
+        except:
+            pass
+        __import__('time').sleep(3)
+    return None
+
+# ── ScriptBlox login to get cookies ──────────────────────────────────────────
+def sb_login(email, password, proxy_r):
+    """Login to ScriptBlox and return session cookies in Cookie-Editor format."""
     try:
-        embed = {
-            "title": "🎯 New Account Generated", "color": 0x00ffcc,
-            "description": f"**{username}** | {email}",
-            "fields": [
-                {"name": "👤 Username", "value": f"```{username}```", "inline": True},
-                {"name": "🔑 Password", "value": f"```{password}```", "inline": True},
-                {"name": "📧 Email",    "value": f"```{email}```",    "inline": False},
-                {"name": "📅 Created",  "value": datetime.now(timezone.utc).strftime("%b %d, %Y"), "inline": True},
-                {"name": "⚡ Status",   "value": "⚠️ Unverified", "inline": True},
-            ],
-            "footer": {"text": "Kuni SB Generator · v2.4"},
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        requests.post(active_webhook, json={"embeds": [embed]}, proxies=NO_PROXY, timeout=10)
+        s = requests.Session()
+        s.headers.update(sb_headers())
+        r = s.post("https://scriptblox.com/api/auth/login",
+            json={"login": email, "password": password},
+            proxies=proxy_r, timeout=20, verify=False)
+        if r.status_code != 200:
+            return None, None
+        # Collect all cookies
+        all_cookies = []
+        for name, val in s.cookies.items():
+            all_cookies.append({
+                "domain": "scriptblox.com",
+                "hostOnly": True,
+                "httpOnly": name == "token",
+                "name": name,
+                "path": "/",
+                "sameSite": "strict" if name == "token" else "no_restriction",
+                "secure": True,
+                "session": False,
+                "storeId": None,
+                "value": val,
+                "expirationDate": (__import__('time').time() + 86400 * 30)
+            })
+        # Also grab token from response JSON
+        resp_data = r.json()
+        token = resp_data.get("token") or resp_data.get("data", {}).get("token")
+        if token and not any(c["name"] == "token" for c in all_cookies):
+            all_cookies.append({
+                "domain": "scriptblox.com",
+                "hostOnly": True,
+                "httpOnly": True,
+                "name": "token",
+                "path": "/",
+                "sameSite": "strict",
+                "secure": True,
+                "session": False,
+                "storeId": None,
+                "value": token,
+                "expirationDate": (__import__('time').time() + 86400 * 30)
+            })
+        return all_cookies, token
+    except:
+        return None, None
+
+# ── Discord Webhook ───────────────────────────────────────────────────────────
+# ── Upload cookies to sourceb.in ─────────────────────────────────────────────
+def upload_cookies_online(cookies_json):
+    """Upload cookie content to sourceb.in pastebin. Returns URL or None."""
+    try:
+        cookie_str = "-- EXPORTED FROM COOKIE-EDITOR, ACCEPTED\n\n" + json.dumps(cookies_json, indent=4)
+        r = requests.post("https://sourceb.in/api/bins",
+            json={"files": [{"content": cookie_str, "languageId": 64}]},
+            headers={"Content-Type": "application/json"},
+            proxies=NO_PROXY, timeout=15)
+        if r.status_code in (200, 201):
+            key = r.json().get("key")
+            if key:
+                return f"https://cdn.sourceb.in/bins/{key}/0"
     except:
         pass
+    return None
+
+def send_webhook(username, password, email, cookies_json=None, verified=False):
+    if not active_webhook: return
+    try:
+        status_str = "✅ Verified" if verified else "⚠️ Unverified"
+        from datetime import timedelta
+        post_date = datetime.now(timezone.utc) + timedelta(days=7)
+        can_post = post_date.strftime("%A, %B %-d, %Y at %I:%M %p") if verified else "—"
+        fields = [
+            {"name": "👤 Username", "value": f"```{username}```", "inline": True},
+            {"name": "🔑 Password", "value": f"```{password}```", "inline": True},
+            {"name": "📅 Can post in", "value": can_post, "inline": False},
+        ]
+
+        # Upload cookies online
+        online_url = None
+        if cookies_json:
+            online_url = upload_cookies_online(cookies_json)
+        if online_url:
+            fields.append({"name": "🔗 Cookies online", "value": online_url, "inline": False})
+        if cookies_json:
+            fields.append({"name": "📎 Cookies attached as file below (import into Cookie-Editor):", "value": "\u200b", "inline": False})
+
+        embed = {
+            "title": "✅ ScriptBlox Account Generated" if verified else "🎯 New Account Generated",
+            "color": 0x00e87a if verified else 0x00ffcc,
+            "fields": fields,
+            "footer": {"text": "sblox gen"},
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        if cookies_json:
+            import io
+            cookie_str = "-- EXPORTED FROM COOKIE-EDITOR, ACCEPTED\n\n" + json.dumps(cookies_json, indent=4)
+            files = {"file": ("cookies.json", io.BytesIO(cookie_str.encode()), "application/json")}
+            payload = {"payload_json": json.dumps({"embeds": [embed]})}
+            requests.post(active_webhook, data=payload, files=files, proxies=NO_PROXY, timeout=15)
+        else:
+            requests.post(active_webhook, json={"embeds": [embed]}, proxies=NO_PROXY, timeout=10)
+    except Exception as e:
+        print("WEBHOOK ERROR:", e)
 
 # ── Utils ─────────────────────────────────────────────────────────────────────
 def rand_username(): return "Kuni" + "".join(random.choices(string.ascii_letters + string.digits, k=10))
@@ -173,17 +286,18 @@ def create_account(slot):
     proxy    = get_random_proxy(proxies_list)
     proxy_r  = proxy_to_requests(proxy)
 
-    cookies, csrf = mw_setup()
-    captcha       = solve_turnstile_capsolver()
-    email_addr, _ = mw_get_email(cookies, csrf)
+    mw_cookies, mw_csrf = mw_setup()
+    captcha            = solve_turnstile_capsolver()
+    email_addr, mw_csrf = mw_get_email(mw_cookies, mw_csrf)
 
     if not email_addr or not captcha:
         state["failed"] += 1
         log_emit(f"[#{slot}] Setup failed (email/captcha)", "err")
         return
 
-    log_emit(f"[#{slot}] preparing account...", "dim")
+    log_emit(f"[#{slot}] creating account...", "dim")
 
+    # ── Step 1: Signup ────────────────────────────────────────────────────────
     try:
         r = requests.post(SB_SIGNUP, json={
             "email": email_addr, "username": username,
@@ -201,18 +315,53 @@ def create_account(slot):
         log_emit(f"[#{slot}] Signup failed: {resp.get('message','')}", "err")
         return
 
-    # Success — increment DB counter
+    log_emit(f"[#{slot}] Account created — waiting for verification email...", "dim")
+
+    # ── Step 2: Poll inbox for verification link ───────────────────────────────
+    verify_url = mw_poll_inbox(mw_cookies, mw_csrf, timeout=90)
+
+    verified = False
+    if verify_url:
+        log_emit(f"[#{slot}] Verification email received — verifying...", "dim")
+        try:
+            vr = requests.get(verify_url, headers=sb_headers(), proxies=proxy_r, timeout=20, verify=False)
+            if vr.status_code in (200, 302) or "verified" in vr.text.lower() or "success" in vr.text.lower():
+                verified = True
+                log_emit(f"[#{slot}] Email verified ✓", "dim")
+            else:
+                log_emit(f"[#{slot}] Verify request sent (status {vr.status_code})", "dim")
+                verified = True  # assume ok if no error
+        except:
+            log_emit(f"[#{slot}] Verify request failed", "dim")
+    else:
+        log_emit(f"[#{slot}] Verification email timeout — saving unverified", "dim")
+
+    # ── Step 3: Login to get cookies ──────────────────────────────────────────
+    cookies_data = None
+    if verified:
+        import time as _time
+        _time.sleep(2)  # small delay before login
+        cookies_data, _ = sb_login(email_addr, password, proxy_r)
+        if cookies_data:
+            log_emit(f"[#{slot}] Cookies captured ✓", "dim")
+        else:
+            log_emit(f"[#{slot}] Cookie capture failed", "dim")
+
+    # ── Step 4: Save & send ───────────────────────────────────────────────────
     with session_lock:
         increment_used(current_key)
 
-    account = {"username": username, "password": password, "email": email_addr}
+    account = {"username": username, "password": password, "email": email_addr, "verified": verified}
+    if cookies_data:
+        account["cookies"] = cookies_data
+
     with file_lock:
         with open(ACCOUNTS_FILE, "a") as f:
             f.write(json.dumps(account) + "\n")
 
-    send_webhook(username, password, email_addr)
+    send_webhook(username, password, email_addr, cookies_json=cookies_data, verified=verified)
     state["created"] += 1
-    log_emit(f"[#{slot}] ✓ {username} | {password}", "ok")
+    log_emit(f"[#{slot}] ✓ {username} | {'verified' if verified else 'unverified'}", "ok")
 
 def run_generator(count, concurrent):
     sem = threading.Semaphore(concurrent)
@@ -795,19 +944,7 @@ function showMainApp() {
 
       <button class="run-btn idle" id="mainBtn" onclick="toggle()">Run Generator</button>
 
-      <!-- TUTORIAL -->
-      <div class="tutorial-card">
-        <div class="tutorial-hdr" onclick="toggleTutorial()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
-          <span style="letter-spacing:2px;font-size:10px">HOW TO USE YOUR ACCOUNTS</span>
-          <span id="tutToggle" style="margin-left:auto;font-size:9px;letter-spacing:2px;color:var(--muted)">▼ SHOW</span>
-        </div>
-        <div class="tutorial-body" id="tutBody">
-          <div class="video-container">
-            <iframe src="https://drive.google.com/file/d/1KgpnvPBwSzS75rAcTzDo8MIunPc9RVtM/preview" class="video-el" frameborder="0" allowfullscreen
-              allow="autoplay" style="position:absolute;inset:0;width:100%;height:100%;border:none;"
-              sandbox="allow-scripts allow-same-origin allow-presentation"></iframe>
-          </div>
+
         </div>
       </div>
 
@@ -838,13 +975,6 @@ function toggleConfig() {
 function togglePanel(id) {
   const p = document.getElementById(id);
   p.classList.toggle('open');
-}
-
-let tutOpen = false;
-function toggleTutorial() {
-  tutOpen = !tutOpen;
-  document.getElementById('tutBody').classList.toggle('open', tutOpen);
-  document.getElementById('tutToggle').textContent = tutOpen ? '▲ HIDE' : '▼ SHOW';
 }
 
 async function loadSavedConfig() {
