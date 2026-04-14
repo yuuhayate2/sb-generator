@@ -104,9 +104,22 @@ def mw_create_session():
             print(f"[mw] session error (attempt {attempt+1}): {e}")
     return None, None, None
 
-def mw_poll_code(mw_sess, csrf, timeout=90):
+def mw_get_existing_ids(mw_sess, csrf):
+    """Get all existing message IDs before signup to avoid picking up old emails."""
+    try:
+        fresh_csrf = unquote(mw_sess.cookies.get("XSRF-TOKEN", csrf))
+        r = mw_sess.post(f"{MW_BASE}/get_messages",
+                         headers={"Content-Type": "application/json",
+                                  "X-CSRF-TOKEN": fresh_csrf},
+                         timeout=15)
+        messages = r.json().get("messages", [])
+        return {msg.get("id", "") for msg in messages}
+    except:
+        return set()
+
+def mw_poll_code(mw_sess, csrf, timeout=90, pre_seen=None):
     deadline = time.time() + timeout
-    seen_ids = set()
+    seen_ids = pre_seen or set()
     while time.time() < deadline:
         try:
             fresh_csrf = unquote(mw_sess.cookies.get("XSRF-TOKEN", csrf))
@@ -487,6 +500,10 @@ def create_account(slot):
         log_emit(f"[#{slot}] MailWave session failed", "err")
         return
 
+    # ── Step 1b: Pre-capture existing message IDs to avoid old emails ───────
+    pre_seen = mw_get_existing_ids(mw_sess, mw_csrf)
+    print(f"[mw] pre-existing messages: {len(pre_seen)}")
+
     # ── Step 2: Turnstile captcha ─────────────────────────────────────────────
     log_emit(f"[#{slot}] [✓] Solving Turnstile captcha...", "dim")
     captcha = solve_turnstile_capsolver()
@@ -531,7 +548,7 @@ def create_account(slot):
     log_emit(f"[#{slot}] [✓] Navigating to verification...", "dim")
     log_emit(f"[#{slot}] [✓] Waiting for verification email...", "dim")
 
-    verify_code = mw_poll_code(mw_sess, mw_csrf, timeout=90)
+    verify_code = mw_poll_code(mw_sess, mw_csrf, timeout=90, pre_seen=pre_seen)
 
     if not verify_code:
         # save unverified — no token yet, fallback login
