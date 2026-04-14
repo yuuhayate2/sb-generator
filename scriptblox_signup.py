@@ -566,10 +566,10 @@ def create_account(slot):
 
         vdata = vr.json() if vr.content else {}
 
-        if vr.status_code == 200 and not vdata.get("error"):
-            new_tok = vdata.get("token") or vdata.get("data", {}).get("token", "")
-            if new_tok:
-                final_token = new_tok
+        # SB verify success response: {"message": false, "token": "eyJ..."}
+        new_tok = vdata.get("token", "")
+        if vr.status_code == 200 and new_tok and vdata.get("message") is False:
+            final_token = new_tok
             verified = True
 
     except Exception as e:
