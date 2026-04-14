@@ -165,13 +165,11 @@ def _rand_gads():
 
 def _rand_fcnec():
     inner = "".join(random.choices(string.ascii_letters + string.digits + "+/=_-", k=80))
-    val   = f'[["AKsRol_{inner}"]]'
-    return quote(val)
+    return f'[["AKsRol_{inner}"]]'
 
 def _rand_fccdcf(creation_ts):
-    uid  = str(uuid.uuid4())
-    val  = f'[null,null,null,null,null,null,[[32,"[\\"{uid}\\",[{creation_ts},432000000]]"]]]'
-    return quote(val)
+    uid = str(uuid.uuid4())
+    return f'[null,null,null,null,null,null,[[32,"[\\"{uid}\\",[{creation_ts},432000000]]"]]]'
 
 def _rand_ga6():
     sess_ts = int(time.time()) - random.randint(0, 3600)
@@ -184,12 +182,11 @@ def _rand_visitor():
 def _rand_validation_token(ts=None):
     if ts is None:
         ts = int(time.time())
-    rand = "".join(random.choices(string.ascii_letters + string.digits + "+/=", k=44))
-    raw  = f"?token{ts}-{rand}"
-    return quote(raw)
+    rand = "".join(random.choices(string.ascii_letters + string.digits, k=44))
+    return f"?token{ts}-{rand}"
 
 def _rand_ua_cookie():
-    return quote("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
 def fabricate_full_cookies(token_value, username, verified=True):
     """
@@ -556,31 +553,25 @@ def create_account(slot):
     final_token = signup_token
 
     try:
-        verify_headers = {**sb_headers(referer="https://scriptblox.com/verify")}
+        verify_sess = requests.Session()
+        verify_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
         if signup_token:
-            verify_headers["Authorization"] = f"Bearer {signup_token}"
+            verify_sess.cookies.set("token", signup_token, domain="scriptblox.com", path="/")
+            verify_sess.headers["Authorization"] = f"Bearer {signup_token}"
 
-        vr = signup_sess.post(SB_VERIFY,
+        vr = verify_sess.post(SB_VERIFY,
                               json={"vCode": int(verify_code)},
-                              headers=verify_headers,
                               proxies=proxy_r, timeout=25, verify=False)
 
         print(f"[verify #{slot}] status={vr.status_code} body={vr.text[:300]}")
 
-        if vr.content:
-            vdata = vr.json()
-        else:
-            vdata = {}
+        vdata = vr.json() if vr.content else {}
 
-        # accept if 200 OR if body has token / no explicit error
-        if vr.status_code == 200:
+        if vr.status_code == 200 and not vdata.get("error"):
             new_tok = vdata.get("token") or vdata.get("data", {}).get("token", "")
             if new_tok:
                 final_token = new_tok
-                signup_sess.cookies.set("token", new_tok, domain="scriptblox.com", path="/")
-            # treat 200 as verified even if body is empty / message:false
-            if not vdata.get("error"):
-                verified = True
+            verified = True
 
     except Exception as e:
         log_emit(f"[#{slot}] Verify error: {e}", "err")
