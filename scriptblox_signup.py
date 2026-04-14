@@ -22,7 +22,8 @@ load_dotenv()
 SUPABASE_URL  = "https://ukwltgxtfikiprsqflhi.supabase.co"
 SUPABASE_KEY  = "sb_publishable_NhI5Z-LriMN_huWOV14AtA_YtmDZeQ3"
 SB_SIGNUP     = "https://scriptblox.com/api/auth/signup"
-MW_DOMAIN     = "aula.edu.pl"
+MW_DOMAINS    = ["aula.edu.pl", "studyhub.org"]
+MW_DOMAIN     = MW_DOMAINS[0]
 MW_BASE       = "https://mailwave.dev"
 NO_PROXY      = {"http": None, "https": None}
 ACCOUNTS_FILE = Path(__file__).parent / "scriptblox_accounts.txt"
@@ -87,41 +88,36 @@ def mw_setup():
         return None, None
 
 def mw_get_email(cookies, csrf):
-    if not csrf or cookies is None: return None, csrf
+    """Get a fresh email alias and return (email, cookies, csrf) all in sync."""
+    if not csrf or cookies is None: return None, cookies, csrf
     for _ in range(20):
         alias = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         try:
-            r = requests.post(f"{MW_BASE}/change", data={"_token": csrf, "name": alias, "domain": MW_DOMAIN},
-                              cookies=cookies, proxies=NO_PROXY, timeout=15)
+            r = requests.post(f"{MW_BASE}/change",
+                data={"_token": csrf, "name": alias, "domain": MW_DOMAIN},
+                cookies=cookies, proxies=NO_PROXY, timeout=15)
             cookies.update(dict(r.cookies))
+            # Always refresh csrf from latest cookies
             new_csrf = unquote(cookies.get("XSRF-TOKEN", csrf))
             r2 = requests.post(f"{MW_BASE}/get_messages",
-                               headers={"Content-Type": "application/json", "X-CSRF-TOKEN": new_csrf},
-                               cookies=cookies, proxies=NO_PROXY, timeout=15)
-            mailbox = r2.json().get("mailbox", "")
-            if MW_DOMAIN in mailbox: return mailbox, new_csrf
-        except:
-            pass
-    return None, csrf
+                headers={"Content-Type": "application/json", "X-CSRF-TOKEN": new_csrf},
+                cookies=cookies, proxies=NO_PROXY, timeout=15)
+            data = r2.json()
+            mailbox = data.get("mailbox", "")
+            if MW_DOMAIN in mailbox:
+                print(f"[mw] email ready: {mailbox}")
+                return mailbox, cookies, new_csrf
+        except Exception as e:
+            print(f"[mw] get_email error: {e}")
+    return None, cookies, csrf
 
 # ── MailWave inbox polling ────────────────────────────────────────────────────
-def mw_poll_code(cookies, csrf, email_addr, timeout=90):
+def mw_poll_code(cookies, csrf, email_addr, existing_ids=None, timeout=90):
     """Poll MailWave for a NEW ScriptBlox 7-digit code — ignores pre-existing messages."""
     import time as _t
-
-    # Snapshot existing message IDs before signup
-    existing_ids = set()
-    try:
-        tok = unquote(cookies.get("XSRF-TOKEN", csrf))
-        r = requests.post(f"{MW_BASE}/get_messages",
-            headers={"Content-Type": "application/json", "X-CSRF-TOKEN": tok},
-            cookies=cookies, proxies=NO_PROXY, timeout=15)
-        for msg in r.json().get("messages", []):
-            existing_ids.add(msg.get("id",""))
-        print(f"[poll] existing msg IDs: {existing_ids}")
-    except Exception as e:
-        print(f"[poll] snapshot error: {e}")
-
+    if existing_ids is None:
+        existing_ids = set()
+    print(f"[poll] starting with {len(existing_ids)} existing IDs to skip")
     deadline = _t.time() + timeout
     while _t.time() < deadline:
         try:
@@ -315,7 +311,7 @@ def create_account(slot):
 
     mw_cookies, mw_csrf = mw_setup()
     captcha            = solve_turnstile_capsolver()
-    email_addr, mw_csrf = mw_get_email(mw_cookies, mw_csrf)
+    email_addr, mw_cookies, mw_csrf = mw_get_email(mw_cookies, mw_csrf)
 
     if not email_addr or not captcha:
         state["failed"] += 1
@@ -324,6 +320,19 @@ def create_account(slot):
 
     log_emit(f"[#{slot}] [✓] Starting...", "dim")
     log_emit(f"[#{slot}] [✓] Loading signup page...", "dim")
+
+    # Snapshot existing inbox IDs BEFORE signup
+    existing_ids = set()
+    try:
+        tok = unquote(mw_cookies.get("XSRF-TOKEN", mw_csrf))
+        snap_r = requests.post(f"{MW_BASE}/get_messages",
+            headers={"Content-Type": "application/json", "X-CSRF-TOKEN": tok},
+            cookies=mw_cookies, proxies=NO_PROXY, timeout=15)
+        for msg in snap_r.json().get("messages", []):
+            existing_ids.add(msg.get("id",""))
+        print(f"[poll] snapshot: {len(existing_ids)} existing IDs")
+    except Exception as e:
+        print(f"[poll] snapshot error: {e}")
 
     # ── Step 1: Signup ────────────────────────────────────────────────────────
     log_emit(f"[#{slot}] [✓] Solving Turnstile captcha...", "dim")
@@ -349,7 +358,7 @@ def create_account(slot):
     log_emit(f"[#{slot}] [✓] Waiting for verification email...", "dim")
 
     # ── Step 2: Poll inbox for 7-digit code ──────────────────────────────────
-    verify_code = mw_poll_code(mw_cookies, mw_csrf, email_addr, timeout=90)
+    verify_code = mw_poll_code(mw_cookies, mw_csrf, email_addr, existing_ids=existing_ids, timeout=90)
 
     verified = False
     if verify_code:
