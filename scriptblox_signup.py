@@ -164,13 +164,14 @@ def _rand_gads():
     return f"ID={uid}:T={ts}:RT={rt}:S=ALNI_{sfx}"
 
 def _rand_fcnec():
-    inner = "".join(random.choices(string.ascii_letters + string.digits + "+/=_-", k=80))
-    return f'[["AKsRol_{inner}"]]'
+    inner = "".join(random.choices(string.ascii_letters + string.digits + "_-", k=80))
+    raw = f'[["AKsRol_{inner}=="]]'
+    return quote(raw)
 
 def _rand_fccdcf(creation_ts):
     uid = str(uuid.uuid4())
-    return f'[null,null,null,null,null,null,[[32,"[\\"{uid}\\",[{creation_ts},432000000]]"]]]'
-
+    raw = '[null,null,null,null,null,null,[[32,"["' + uid + '",[' + str(creation_ts) + ',432000000]]"]]]'
+    return quote(raw)
 def _rand_ga6():
     sess_ts = int(time.time()) - random.randint(0, 3600)
     cur_ts  = int(time.time())
@@ -182,11 +183,12 @@ def _rand_visitor():
 def _rand_validation_token(ts=None):
     if ts is None:
         ts = int(time.time())
-    rand = "".join(random.choices(string.ascii_letters + string.digits, k=44))
-    return f"?token{ts}-{rand}"
+    rand = "".join(random.choices(string.ascii_letters + string.digits + "+/=", k=44))
+    raw = f"?token{ts}-{rand}"
+    return quote(raw)
 
 def _rand_ua_cookie():
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+    return quote("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
 
 def fabricate_full_cookies(token_value, username, verified=True):
     """
