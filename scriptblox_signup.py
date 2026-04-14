@@ -307,9 +307,6 @@ def create_account(slot):
 
     signup_token = resp.get("token") or resp.get("data", {}).get("token", "")
     print(f"[signup] token: {signup_token[:30] if signup_token else 'none'}")
-    # Set token cookie in session so verify request is authenticated
-    if signup_token:
-        signup_sess.cookies.set("token", signup_token, domain="scriptblox.com", path="/")
 
     log_emit(f"[#{slot}] [✓] Creating account...", "dim")
     log_emit(f"[#{slot}] [✓] Navigating to verification...", "dim")
@@ -321,12 +318,8 @@ def create_account(slot):
     if verify_code:
         log_emit(f"[#{slot}] [✓] Entering verification code...", "dim")
         try:
-            verify_headers = {**sb_headers()}
-            if signup_token:
-                verify_headers["Authorization"] = f"Bearer {signup_token}"
             vr = signup_sess.post("https://scriptblox.com/api/auth/verify",
                 json={"vCode": int(verify_code)},
-                headers=verify_headers,
                 proxies=proxy_r, timeout=20, verify=False)
             vdata = vr.json() if vr.content else {}
             print(f"[verify] response: {vdata}")
