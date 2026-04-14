@@ -555,12 +555,18 @@ def create_account(slot):
     final_token = signup_token
 
     try:
-        # reuse signup_sess — explicitly set token in both cookie and Authorization header
-        signup_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
+        # visit /verify page first to establish session state (like browser does)
         if signup_token:
             signup_sess.cookies.set("token", signup_token, domain="scriptblox.com", path="/")
+        try:
+            signup_sess.get("https://scriptblox.com/verify",
+                           proxies=proxy_r, timeout=15, verify=False)
+        except:
+            pass
+
+        signup_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
+        if signup_token:
             signup_sess.headers["Authorization"] = f"Bearer {signup_token}"
-            signup_sess.headers["Cookie"] = f"token={signup_token}"
 
         vr = signup_sess.post(SB_VERIFY,
                               json={"vCode": int(verify_code)},
