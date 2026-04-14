@@ -306,9 +306,9 @@ def create_account(slot):
     proxy    = get_random_proxy(proxies_list)
     proxy_r  = proxy_to_requests(proxy)
 
-    # ── Setup MailWave session + CapSolver simultaneously ─────────────────────
-    mw_sess, mw_csrf, email_addr = mw_create_session()
+    # ── Setup: CapSolver first, then MailWave ────────────────────────────────
     captcha = solve_turnstile_capsolver()
+    mw_sess, mw_csrf, email_addr = mw_create_session()
 
     if not email_addr or not captcha:
         state["failed"] += 1
