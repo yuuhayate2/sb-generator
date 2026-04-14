@@ -546,20 +546,17 @@ def create_account(slot):
         _save_and_send(slot, username, password, email_addr, cookies_data, verified=False)
         return
 
-    # ── Step 5: Submit verification code ─────────────────────────────────────
+    # ── Step 5: Submit verification code (using same signup session) ─────────
     log_emit(f"[#{slot}] [✓] Entering verification code...", "dim")
 
     verified    = False
     final_token = signup_token
 
     try:
-        verify_sess = requests.Session()
-        verify_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
-        if signup_token:
-            verify_sess.cookies.set("token", signup_token, domain="scriptblox.com", path="/")
-            verify_sess.headers["Authorization"] = f"Bearer {signup_token}"
+        # reuse signup_sess — it already has the token cookie set from signup
+        signup_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
 
-        vr = verify_sess.post(SB_VERIFY,
+        vr = signup_sess.post(SB_VERIFY,
                               json={"vCode": int(verify_code)},
                               proxies=proxy_r, timeout=25, verify=False)
 
@@ -576,16 +573,14 @@ def create_account(slot):
     except Exception as e:
         log_emit(f"[#{slot}] Verify error: {e}", "err")
 
-    # ── Step 6: Re-login if needed to get a fresh token ──────────────────────
-    if not verified or not final_token:
-        log_emit(f"[#{slot}] [✓] Re-logging in to get fresh token...", "dim")
-        login_token, _ = _do_login(email_addr, password, proxy_r)
-        if login_token:
-            final_token = login_token
-            verified    = True   # if login succeeded, account is live
+    # ── Step 6: Login after verify to get fresh verified token ────────────────
+    if verified:
+        log_emit(f"[#{slot}] [✓] Fetching verified token...", "dim")
+        fresh_tok, _ = _do_login(email_addr, password, proxy_r)
+        if fresh_tok:
+            final_token = fresh_tok
 
     if not final_token:
-        # last resort — use whatever we had
         final_token = signup_token or ""
 
     # ── Step 7: Fabricate full cookie set ────────────────────────────────────
