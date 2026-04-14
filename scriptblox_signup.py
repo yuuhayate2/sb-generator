@@ -573,18 +573,29 @@ def create_account(slot):
     except Exception as e:
         log_emit(f"[#{slot}] Verify error: {e}", "err")
 
-    # ── Step 6: Login after verify to get fresh verified token ────────────────
-    if verified:
-        log_emit(f"[#{slot}] [✓] Fetching verified token...", "dim")
-        fresh_tok, _ = _do_login(email_addr, password, proxy_r)
-        if fresh_tok:
-            final_token = fresh_tok
+    # ── Step 6: Get cookies from session after verify ────────────────────────
+    log_emit(f"[#{slot}] [✓] Fetching cookies...", "dim")
 
-    if not final_token:
+    if verified:
+        # visit home so SB sets all cookies (same as browser redirect after verify)
+        try:
+            signup_sess.get(SB_HOME, proxies=proxy_r, timeout=15, verify=False)
+        except:
+            pass
+
+    # extract real cookies from session
+    KEEP = {"token", "__scriptblox_validation", "__scriptblox_ua_", "visitor", "i18n_redirected"}
+    raw_cookies = {}
+    for c in signup_sess.cookies:
+        raw_cookies[c.name] = c
+
+    real_token = raw_cookies.get("token")
+    if real_token:
+        final_token = real_token.value
+    elif not final_token:
         final_token = signup_token or ""
 
-    # ── Step 7: Fabricate full cookie set ────────────────────────────────────
-    log_emit(f"[#{slot}] [✓] Fetching cookies...", "dim")
+    # fabricate full set using real token
     cookies_data = fabricate_full_cookies(final_token, username, verified=verified) if final_token else None
 
     with session_lock:
