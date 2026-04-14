@@ -354,17 +354,16 @@ def create_account(slot):
     if verify_code:
         log_emit(f"[#{slot}] [✓] Entering verification code...", "dim")
         try:
-            verify_hdrs = {**sb_headers()}
-            if signup_token:
-                verify_hdrs["Authorization"] = f"Bearer {signup_token}"
+            # Use same signup session — cookies carry the auth
             vr = signup_sess.post("https://scriptblox.com/api/auth/verify",
                 json={"vCode": int(verify_code)},
-                headers=verify_hdrs,
                 proxies=proxy_r, timeout=20, verify=False)
             vdata = vr.json() if vr.content else {}
             print(f"[verify] response: {vdata}")
-            if vdata.get("token") or vdata.get("message") == False:
+            if vdata.get("message") == False and vdata.get("token"):
                 verified = True
+                # Update session with new token cookie from response
+                signup_sess.cookies.set("token", vdata["token"], domain="scriptblox.com")
             else:
                 log_emit(f"[#{slot}] Verify failed: {vdata}", "err")
         except Exception as e:
@@ -378,7 +377,26 @@ def create_account(slot):
         import time as _time
         _time.sleep(2)
         log_emit(f"[#{slot}] [✓] Fetching cookies...", "dim")
-        cookies_data, _ = sb_login(email_addr, password, proxy_r)
+        # Extract cookies directly from signup session — already verified
+        cookies_data = []
+        import time as _t2
+        for name, value in signup_sess.cookies.items():
+            cookies_data.append({
+                "domain": "scriptblox.com",
+                "hostOnly": True,
+                "httpOnly": name == "token",
+                "name": name,
+                "path": "/",
+                "sameSite": "strict" if name == "token" else "no_restriction",
+                "secure": True,
+                "session": False,
+                "storeId": None,
+                "value": value,
+                "expirationDate": _t2.time() + 86400 * 30
+            })
+        if not cookies_data:
+            # Fallback to login
+            cookies_data, _ = sb_login(email_addr, password, proxy_r)
 
     # ── Step 4: Save + Send ───────────────────────────────────────────────────
     with session_lock:
