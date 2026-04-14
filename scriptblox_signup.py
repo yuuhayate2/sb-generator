@@ -106,10 +106,12 @@ def mw_get_email(cookies, csrf):
 
 # ── MailWave inbox polling ────────────────────────────────────────────────────
 def mw_poll_code(cookies, csrf, email_addr, timeout=90):
-    """Poll MailWave inbox for ScriptBlox 7-digit verification code for specific email."""
+    """Poll MailWave for a NEW ScriptBlox 7-digit code — ignores old messages."""
     import time as _t
     deadline = _t.time() + timeout
-    seen_ids = set()
+    signup_time = datetime.now(timezone.utc)
+    seen_codes = set()
+
     while _t.time() < deadline:
         try:
             tok = unquote(cookies.get("XSRF-TOKEN", csrf))
@@ -118,28 +120,38 @@ def mw_poll_code(cookies, csrf, email_addr, timeout=90):
                 cookies=cookies, proxies=NO_PROXY, timeout=15)
             data = r.json()
             messages = data.get("messages", [])
-            # Sort by receivedAt descending to get latest first
-            messages = sorted(messages, key=lambda m: m.get("receivedAt",""), reverse=True)
+
             for msg in messages:
-                msg_id = msg.get("id","")
-                # Only check messages from ScriptBlox
-                sender = msg.get("from_email","") + msg.get("from","")
-                if "scriptblox" not in sender.lower():
+                # Only from ScriptBlox
+                sender = (msg.get("from_email","") + msg.get("from","")).lower()
+                if "scriptblox" not in sender:
                     continue
-                content = (
-                    msg.get("content") or
-                    msg.get("html") or
-                    msg.get("body") or ""
-                )
+
+                # Only messages received AFTER signup
+                received = msg.get("receivedAt","")
+                if received:
+                    try:
+                        from datetime import datetime as dt
+                        # parse ISO format
+                        msg_time = dt.fromisoformat(received.replace("Z","+00:00"))
+                        if msg_time < signup_time:
+                            continue  # skip old messages
+                    except:
+                        pass
+
+                content = msg.get("content") or msg.get("html") or msg.get("body") or ""
                 if isinstance(content, bool):
                     content = ""
                 content = str(content)
-                # Look for 7-digit code
+
                 match = re.search(r"\b(\d{7})\b", content)
                 if match:
                     code = match.group(1)
-                    print(f"[poll] found code: {code} in msg {msg_id}")
-                    return code
+                    if code not in seen_codes:
+                        seen_codes.add(code)
+                        print(f"[poll] new code found: {code}")
+                        return code
+
         except Exception as e:
             print(f"[poll] error: {e}")
         _t.sleep(3)
