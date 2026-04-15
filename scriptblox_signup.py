@@ -239,7 +239,9 @@ def verify():
     try:
         key = (request.json or {}).get("key","").strip()
         if not key: return jsonify({"valid": False, "error": "no_key"})
-        hwid = get_hwid(request.remote_addr)
+        # Use client-sent device fingerprint if provided, fallback to IP
+        client_hwid = (request.json or {}).get("hwid", "").strip()
+        hwid = client_hwid if client_hwid else get_hwid(request.remote_addr)
         rec  = fetch_license(key)
         if not rec:  return jsonify({"valid": False, "error": "not_found"})
         if rec.get("status") != "active": return jsonify({"valid": False, "error": "disabled"})
@@ -302,7 +304,7 @@ def get_proxies():
 @app.route("/get-webhook", methods=["GET"])
 def get_webhook():
     if not license_valid: return jsonify({"ok": False})
-    return jsonify({"ok": True, "webhook": active_webhook})
+    return jsonify({"ok": True, "has_webhook": bool(active_webhook)})
 
 # ── SocketIO ──────────────────────────────────────────────────────────────────
 @socketio.on("get_info")
@@ -547,6 +549,45 @@ const ERR_MAP = {
   server_error:  'server error — try again later',
 };
 
+// ── DEVICE FINGERPRINT ───────────────────────────────────────────────────────
+async function getDeviceFingerprint() {
+  try {
+    // Canvas fingerprint
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    ctx.textBaseline = 'top';
+    ctx.font = '14px Arial';
+    ctx.fillStyle = '#f60';
+    ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = '#069';
+    ctx.fillText('kuni-fp', 2, 15);
+    ctx.fillStyle = 'rgba(102,204,0,0.7)';
+    ctx.fillText('kuni-fp', 4, 17);
+    const canvasData = canvas.toDataURL();
+
+    const raw = [
+      navigator.userAgent,
+      navigator.language,
+      screen.width + 'x' + screen.height,
+      screen.colorDepth,
+      new Date().getTimezoneOffset(),
+      navigator.hardwareConcurrency || 0,
+      navigator.platform,
+      navigator.maxTouchPoints || 0,
+      canvasData.slice(-64), // last 64 chars of canvas data
+    ].join('|');
+
+    // SHA-256 the fingerprint
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+  } catch {
+    // Fallback — random persistent ID stored in localStorage
+    let id = localStorage.getItem('_did');
+    if (!id) { id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); localStorage.setItem('_did', id); }
+    return id;
+  }
+}
+
 // ── TRIAL ────────────────────────────────────────────────────────────────────
 async function claimTrial() {
   const btn = document.getElementById('trialBtn');
@@ -554,7 +595,8 @@ async function claimTrial() {
   btn.classList.add('loading'); btn.textContent = 'Claiming...';
   err.textContent = ''; err.style.color = 'var(--muted)';
   try {
-    const r = await fetch('/claim-trial', {method:'POST', headers:{'Content-Type':'application/json'}});
+    const hwid = await getDeviceFingerprint();
+    const r = await fetch('/claim-trial', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hwid})});
     const d = await r.json();
     if (d.ok) {
       // Auto-fill and verify the trial key
@@ -563,7 +605,7 @@ async function claimTrial() {
       if (input) { input.value = d.key; }
       // Auto verify
       setTimeout(async () => {
-        const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:d.key})});
+        const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:d.key, hwid})});
         const vd = await vr.json();
         if (vd.valid) {
           localStorage.setItem('license', d.key);
@@ -575,14 +617,14 @@ async function claimTrial() {
       err.style.color = 'var(--gold)';
       err.textContent = 'device already has a trial — enter your key above';
       if (document.getElementById('licInput')) document.getElementById('licInput').value = d.key;
-      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 5 accounts';
+      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
     } else {
       err.style.color = 'var(--red)'; err.textContent = 'failed to claim trial — try again';
-      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 5 accounts';
+      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
     }
   } catch {
     err.style.color = 'var(--red)'; err.textContent = 'server error — try again';
-    btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 5 accounts';
+    btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
   }
 }
 
@@ -599,8 +641,8 @@ function showLicenseScreen() {
         <div class="lic-err" id="licErr"></div>
 
         <div class="trial-divider"><span>OR</span></div>
-        <button class="trial-btn" id="trialBtn" onclick="claimTrial()">🎁 Get Free Trial — 5 accounts</button>
-        <div class="trial-note">1 free trial per device · 30 days · HWID locked</div>
+        <button class="trial-btn" id="trialBtn" onclick="claimTrial()">🎁 Get Free Trial — 1 account</button>
+        <div class="trial-note">1 free trial per device · 1 account · HWID locked</div>
 
         <div class="price-section">
           <div class="price-title">PRICING</div>
@@ -655,7 +697,8 @@ async function doLogin() {
   err.style.color='#4a6070'; err.textContent='connecting to license server...';
   dot && dot.classList.add('active');
   try {
-    const res  = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+    const hwid = await getDeviceFingerprint();
+    const res  = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key, hwid})});
     const data = await res.json();
     if (data.valid) {
       localStorage.setItem('license', key);
@@ -815,11 +858,14 @@ async function loadSavedConfig() {
       badge.className = 'badge' + (d.count > 0 ? ' ok' : '');
     }
   } catch {}
-  // Load webhook
+  // Load webhook status only - never show actual URL
   try {
     const r = await fetch('/get-webhook');
     const d = await r.json();
-    if (d.ok && d.webhook) document.getElementById('webhookInput').value = d.webhook;
+    if (d.ok && d.has_webhook) {
+      const st = document.getElementById('webhookSt');
+      if (st) { st.style.color='var(--green)'; st.textContent='webhook set ✓'; }
+    }
   } catch {}
 }
 
@@ -952,13 +998,15 @@ function initSocket() {
 // ── Init ─────────────────────────────────────────────────────────────────────
 const savedKey = localStorage.getItem('license');
 if (savedKey) {
-  fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:savedKey})})
+  getDeviceFingerprint().then(hwid => {
+  fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:savedKey, hwid})})
     .then(r=>r.json())
     .then(data => {
       if (data.valid) { licenseInfo=data; showMainApp(); }
       else { localStorage.removeItem('license'); showLicenseScreen(); }
     })
     .catch(() => showLicenseScreen());
+  });
 } else {
   showLicenseScreen();
 }
@@ -971,7 +1019,9 @@ if (savedKey) {
 @app.route("/claim-trial", methods=["POST"])
 def claim_trial():
     try:
-        hwid = get_hwid(request.remote_addr)
+        # Use client-sent device fingerprint if provided, fallback to IP
+        client_hwid = (request.json or {}).get("hwid", "").strip()
+        hwid = client_hwid if client_hwid else get_hwid(request.remote_addr)
 
         # Check if this HWID already has a trial
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
@@ -991,7 +1041,7 @@ def claim_trial():
 
         body = {
             "license_key":    key,
-            "accounts_limit": 5,
+            "accounts_limit": 1,
             "accounts_used":  0,
             "expiry_date":    expiry,
             "status":         "active",
