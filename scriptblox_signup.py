@@ -395,6 +395,7 @@ HTML = r"""<!DOCTYPE html>
   .price-limit { font-size: 9px; color: var(--muted); letter-spacing: 1px; margin-bottom: 8px; }
   .price-amt { font-family: var(--sans); font-size: 15px; font-weight: 800; color: var(--cyan); white-space: nowrap; }
   .price-dur { font-size: 8px; color: var(--muted); letter-spacing: 1px; margin-top: 2px; }
+  .price-php { font-size: 9px; color: var(--muted); letter-spacing: 1px; margin-top: 2px; }
   .price-card.featured .price-amt { color: var(--green); }
 
   /* discord contact */
@@ -607,20 +608,23 @@ function showLicenseScreen() {
             <div class="price-card">
               <div class="price-name">BASIC</div>
               <div class="price-limit">100 accounts</div>
-              <div class="price-amt">₱XX</div>
+              <div class="price-amt">$59.99</div>
+              <div class="price-php">≈ ₱3,389</div>
               <div class="price-dur">30 days</div>
             </div>
             <div class="price-card featured">
               <div class="price-name">PRO</div>
               <div class="price-limit">500 accounts</div>
-              <div class="price-amt">₱XX</div>
+              <div class="price-amt">$249.99</div>
+              <div class="price-php">≈ ₱14,124</div>
               <div class="price-dur">30 days</div>
             </div>
             <div class="price-card">
               <div class="price-name">UNLIMITED</div>
               <div class="price-limit">no limit</div>
-              <div class="price-amt">₱XX</div>
-              <div class="price-dur">30 days</div>
+              <div class="price-amt">$399.99</div>
+              <div class="price-php">≈ ₱22,599</div>
+              <div class="price-dur">60 days</div>
             </div>
           </div>
           <div class="discord-section">
