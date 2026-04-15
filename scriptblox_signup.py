@@ -81,6 +81,7 @@ def dm_create_email():
             r = requests.post(f"{DM_BASE}/api/create-custom-email",
                               json={"username": alias, "domain": DM_DOMAIN},
                               timeout=15, proxies=NO_PROXY)
+            print(f"[dm] create status={r.status_code} body={r.text[:200]}")
             data = r.json()
             if data.get("success"):
                 email = data.get("email", "")
