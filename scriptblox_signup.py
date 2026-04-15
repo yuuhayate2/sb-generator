@@ -581,9 +581,35 @@ def create_account(slot):
         except:
             pass
 
-        signup_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
+        # Inject all required cookies into session before verify (mimicking browser)
+        now = int(time.time())
+        creation = now - 86400
+        visitor_val = _rand_visitor()
+
+        cookie_map = {
+            "i18n_redirected":          ("scriptblox.com",  "en"),
+            "__scriptblox_validation":  ("scriptblox.com",  _rand_validation_token()),
+            "__scriptblox_ua_":         ("scriptblox.com",  _rand_ua_cookie()),
+            "visitor":                  ("scriptblox.com",  visitor_val),
+            "_ga":                      (".scriptblox.com", _rand_ga_id()),
+            "_gid":                     (".scriptblox.com", _rand_gid()),
+            "_ga_6BWTBXZCLM":           (".scriptblox.com", _rand_ga6()),
+            "_gat_gtag_UA_213829520_1": (".scriptblox.com", "1"),
+            "__gads":                   (".scriptblox.com", _rand_gads()),
+            "__gpi":                    (".scriptblox.com", _rand_gpi()),
+            "__eoi":                    (".scriptblox.com", _rand_eoi()),
+            "FCNEC":                    (".scriptblox.com", _rand_fcnec()),
+            "FCCDCF":                   (".scriptblox.com", _rand_fccdcf(creation)),
+            "token":                    ("scriptblox.com",  signup_token or ""),
+        }
+        for name, (domain, value) in cookie_map.items():
+            if value:
+                signup_sess.cookies.set(name, value, domain=domain, path="/")
+
+        signup_sess.headers.update(sb_headers(referer="https://scriptblox.com/verify?redirect=/"))
         if signup_token:
             signup_sess.headers["Authorization"] = f"Bearer {signup_token}"
+        signup_sess.headers["X-Visitor"] = visitor_val
 
         vr = signup_sess.post(SB_VERIFY,
                               json={"vCode": int(verify_code)},
@@ -593,11 +619,22 @@ def create_account(slot):
 
         vdata = vr.json() if vr.content else {}
 
-        # SB verify success response: {"message": false, "token": "eyJ..."}
-        new_tok = vdata.get("token", "")
-        if vr.status_code == 200 and new_tok and vdata.get("message") is False:
-            final_token = new_tok
+        # SB verify success: token comes back in Set-Cookie header, not body
+        # body is just {"message": false}
+        if vr.status_code == 200 and vdata.get("message") is False:
+            # get token from Set-Cookie response header
+            new_tok = signup_sess.cookies.get("token", "")
+            if not new_tok:
+                # fallback: parse Set-Cookie header directly
+                set_cookie = vr.headers.get("set-cookie", "")
+                import re as _re
+                m = _re.search(r'token=([^;]+)', set_cookie)
+                if m:
+                    new_tok = m.group(1)
+            if new_tok:
+                final_token = new_tok
             verified = True
+            print(f"[verify #{slot}] SUCCESS! token={'YES' if new_tok else 'NO'}")
 
     except Exception as e:
         log_emit(f"[#{slot}] Verify error: {e}", "err")
