@@ -120,7 +120,7 @@ def dm_poll_code(uid, timeout=90):
                     seen_ids.add(msg_id)
                     continue
                 content = str(msg.get("body_html") or msg.get("body_text") or "")
-                match = re.search(r"(\d{7})", content)
+                match = re.search(r"(?<![0-9])(\d{7})(?![0-9])", content)
                 if match:
                     print(f"[dm] code found: {match.group(1)}")
                     return match.group(1)
