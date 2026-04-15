@@ -548,28 +548,10 @@ def create_account(slot):
     now         = int(time.time())
     creation    = now - 86400
 
-    # inject all cookies exactly like browser
-    cookie_map = {
-        "i18n_redirected":          ("scriptblox.com",  "en"),
-        "__scriptblox_validation":  ("scriptblox.com",  _rand_validation_token()),
-        "__scriptblox_ua_":         ("scriptblox.com",  _rand_ua_cookie()),
-        "visitor":                  ("scriptblox.com",  visitor_val),
-        "_ga":                      (".scriptblox.com", _rand_ga_id()),
-        "_gid":                     (".scriptblox.com", _rand_gid()),
-        "_ga_6BWTBXZCLM":           (".scriptblox.com", _rand_ga6()),
-        "_gat_gtag_UA_213829520_1": (".scriptblox.com", "1"),
-        "__gads":                   (".scriptblox.com", _rand_gads()),
-        "__gpi":                    (".scriptblox.com", _rand_gpi()),
-        "__eoi":                    (".scriptblox.com", _rand_eoi()),
-        "FCNEC":                    (".scriptblox.com", _rand_fcnec()),
-        "FCCDCF":                   (".scriptblox.com", _rand_fccdcf(creation)),
-        "token":                    ("scriptblox.com",  signup_token or ""),
-    }
-    for name, (domain, value) in cookie_map.items():
-        if value:
-            sess.cookies.set(name, value, domain=domain, path="/")
-
-    sess.headers.update(sb_headers(referer="https://scriptblox.com/verify?redirect=/"))
+    # Set token as cookie + Authorization header (both, like browser does)
+    if signup_token:
+        sess.cookies.set("token", signup_token, domain="scriptblox.com", path="/")
+    sess.headers.update(sb_headers(referer="https://scriptblox.com/verify"))
     sess.headers["Authorization"] = f"Bearer {signup_token}"
     sess.headers["X-Visitor"]     = visitor_val
 
