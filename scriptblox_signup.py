@@ -746,7 +746,7 @@ def test_webhook(url):
             "avatar_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
             "embeds": [{
                 "author": {
-                    "name":  𓆩☠︎︎𓆪 "KUNI · SB GENERATOR",
+                    "name":     "KUNI · SB GENERATOR",
                     "icon_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
                 },
                 "title":       "✅  Webhook Connected",
