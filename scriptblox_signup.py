@@ -18,7 +18,7 @@ import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 
 import requests, urllib3
 urllib3.disable_warnings()
@@ -36,8 +36,11 @@ load_dotenv()
 SUPABASE_URL  = "https://ukwltgxtfikiprsqflhi.supabase.co"
 SUPABASE_KEY  = "sb_publishable_NhI5Z-LriMN_huWOV14AtA_YtmDZeQ3"
 SB_SIGNUP     = "https://scriptblox.com/api/auth/signup"
-MW_DOMAIN     = "aula.edu.pl"
-MW_BASE       = "https://mailwave.dev"
+SB_VERIFY     = "https://scriptblox.com/api/auth/verify"
+SB_LOGIN      = "https://scriptblox.com/api/auth/login"
+SB_HOME       = "https://scriptblox.com/"
+DM_BASE       = "https://dismail.top"
+DM_DOMAIN     = "dismail.top"
 NO_PROXY      = {"http": None, "https": None}
 
 USER_DATA_DIR = Path(__file__).parent / "user_data"
@@ -252,139 +255,179 @@ def atomic_increment_used(key, limit):
                 time.sleep(0.1)
         return (None, False)
 
-# ── MailWave ──────────────────────────────────────────────────────────────────
-def mw_setup():
-    try:
-        r = requests.get(f"{MW_BASE}/", proxies=NO_PROXY, timeout=15)
-        token = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
-        csrf = token.group(1) if token else None
-        return dict(r.cookies), csrf
-    except:
-        return None, None
-
-def mw_get_email(cookies, csrf):
-    if not csrf or cookies is None: return None, csrf
-    for _ in range(20):
-        alias = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+# ── DisMail helpers ───────────────────────────────────────────────────────────
+def dm_create_email():
+    """Create a disposable email via DisMail API. Returns (uid, email) or (None, None)."""
+    for attempt in range(3):
         try:
-            r = requests.post(f"{MW_BASE}/change",
-                              data={"_token": csrf, "name": alias, "domain": MW_DOMAIN},
-                              cookies=cookies, proxies=NO_PROXY, timeout=15)
-            cookies.update(dict(r.cookies))
-            new_csrf = unquote(cookies.get("XSRF-TOKEN", csrf))
-            r2 = requests.post(f"{MW_BASE}/get_messages",
-                               headers={"Content-Type": "application/json", "X-CSRF-TOKEN": new_csrf},
-                               cookies=cookies, proxies=NO_PROXY, timeout=15)
-            mailbox = r2.json().get("mailbox", "")
-            if MW_DOMAIN in mailbox: return mailbox, new_csrf
-        except: pass
-    return None, csrf
-
-def mw_fetch_messages(cookies, csrf):
-    """Fetch current inbox contents from MailWave. Returns raw JSON dict."""
-    try:
-        r = requests.post(f"{MW_BASE}/get_messages",
-                          headers={"Content-Type": "application/json", "X-CSRF-TOKEN": csrf},
-                          cookies=cookies, proxies=NO_PROXY, timeout=15)
-        if r.status_code == 200: return r.json()
-    except: pass
-    return {}
-
-def _extract_text_from_message(msg):
-    """Flatten all text-like fields in a message dict into one searchable string."""
-    if not isinstance(msg, dict): return ""
-    parts = []
-    for k in ("from","sender","from_email","subject","body","body_html","body_text",
-              "html","text","content","message","preview","snippet"):
-        v = msg.get(k)
-        if isinstance(v, str): parts.append(v)
-        elif isinstance(v, dict):
-            for sub in v.values():
-                if isinstance(sub, str): parts.append(sub)
-    return " ".join(parts)
-
-def mw_wait_for_sb_code(cookies, csrf, max_wait=120, poll_interval=4):
-    """Poll MailWave inbox for ScriptBlox verification email. Returns 7-digit code or None."""
-    deadline = time.time() + max_wait
-    # Brief initial wait — MailWave often needs a few seconds to receive
-    time.sleep(3)
-    while time.time() < deadline:
-        data = mw_fetch_messages(cookies, csrf)
-        # MailWave may put messages under different keys depending on version
-        msgs = (data.get("messages") or data.get("emails") or data.get("inbox")
-                or data.get("mail") or [])
-        if isinstance(msgs, dict): msgs = list(msgs.values())
-        if not isinstance(msgs, list): msgs = []
-
-        for msg in msgs:
-            blob = _extract_text_from_message(msg)
-            if not blob: continue
-            blob_lower = blob.lower()
-            # Identify SB-origin messages (sender OR subject OR brand text)
-            is_sb = ("scriptblox" in blob_lower or
-                     "verification code" in blob_lower or
-                     "verify your email" in blob_lower or
-                     ("verify" in blob_lower and "code" in blob_lower))
-            if not is_sb: continue
-            # Extract 7-digit code (SB uses 7 digits)
-            for m in re.finditer(r'(?<!\d)(\d{7})(?!\d)', blob):
-                code = m.group(1)
-                # Reject placeholder/invalid codes
-                if code in ("0000000","1234567","7777777"): continue
-                return code
-        time.sleep(poll_interval)
-    return None
-
-# ── ScriptBlox verification + login ───────────────────────────────────────────
-def sb_verify_email(code, email, cookies_dict):
-    """Submit verification code. Tries multiple endpoint/payload shapes.
-    Returns (response, payload_used) on success, (None, None) on failure."""
-    attempts = [
-        ("https://scriptblox.com/api/auth/verify-email",  {"code": code}),
-        ("https://scriptblox.com/api/auth/verify-email",  {"code": code, "email": email}),
-        ("https://scriptblox.com/api/auth/verify",        {"code": code}),
-        ("https://scriptblox.com/api/auth/verify",        {"code": code, "email": email}),
-        ("https://scriptblox.com/api/auth/verify-code",   {"code": code}),
-        ("https://scriptblox.com/api/auth/email/verify",  {"code": code}),
-    ]
-    for url, payload in attempts:
-        try:
-            r = requests.post(url, json=payload, headers=sb_headers(),
-                              cookies=cookies_dict, timeout=20, verify=False)
-            if r.status_code in (200, 201):
-                try:
-                    body = r.json() if r.content else {}
-                except: body = {}
-                # Reject obvious "not found" / "error" responses
-                if isinstance(body, dict) and body.get("error"): continue
-                return r, {"url": url, "payload": payload}
-        except: pass
+            alias = "kuni" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            r = requests.post(f"{DM_BASE}/api/create-custom-email",
+                              json={"username": alias, "domain": DM_DOMAIN},
+                              timeout=15, proxies=NO_PROXY)
+            data = r.json()
+            if data.get("success"):
+                email = data.get("email", "")
+                uid   = data.get("id", alias)
+                return uid, email
+        except Exception as e:
+            print(f"[dm] create error (attempt {attempt+1}): {e}")
     return None, None
 
-def sb_resend_code(cookies_dict, email):
-    """Ask SB to resend the code (in case first email got lost)."""
-    urls = [
-        "https://scriptblox.com/api/auth/resend-code",
-        "https://scriptblox.com/api/auth/resend-verification",
-        "https://scriptblox.com/api/auth/verify-email/resend",
-    ]
-    for url in urls:
-        try:
-            r = requests.post(url, json={"email": email}, headers=sb_headers(),
-                              cookies=cookies_dict, timeout=15, verify=False)
-            if r.status_code in (200, 201): return True
-        except: pass
-    return False
-
-def sb_login(email, password):
-    """Login to SB — returns response (for cookie extraction) or None."""
+def dm_poll_code(uid, timeout=90):
+    """Poll DisMail inbox for ScriptBlox 7-digit verification code."""
+    deadline  = time.time() + timeout
+    seen_ids  = set()
+    # Pre-populate seen_ids with existing messages
     try:
-        r = requests.post("https://scriptblox.com/api/auth/login",
-                          json={"email": email, "password": password},
-                          headers=sb_headers(), timeout=20, verify=False)
-        if r.status_code in (200, 201): return r
+        r = requests.get(f"{DM_BASE}/api/check-inbox/{uid}",
+                         timeout=15, proxies=NO_PROXY)
+        for msg in r.json().get("messages", []):
+            seen_ids.add(msg.get("id", ""))
     except: pass
+
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{DM_BASE}/api/check-inbox/{uid}",
+                             timeout=15, proxies=NO_PROXY)
+            messages = r.json().get("messages", [])
+            for msg in messages:
+                msg_id = msg.get("id", "")
+                if msg_id in seen_ids: continue
+                sender = str(msg.get("sender", "")).lower()
+                if "scriptblox" not in sender:
+                    seen_ids.add(msg_id)
+                    continue
+                content = str(msg.get("body_html") or msg.get("body_text") or "")
+                match = re.search(r"(?<!\d)(\d{7})(?!\d)", content)
+                if match:
+                    return match.group(1)
+                seen_ids.add(msg_id)
+        except Exception as e:
+            print(f"[dm] poll error: {e}")
+        time.sleep(2)
     return None
+
+# ── ScriptBlox verify + login ─────────────────────────────────────────────────
+def sb_verify_account(code, token_value, proxy_r=None):
+    """Submit vCode to SB. Returns (response, verified_bool)."""
+    try:
+        hdrs = sb_headers()
+        hdrs["Referer"] = "https://scriptblox.com/verify"
+        hdrs["Authorization"] = f"Bearer {token_value}"
+        r = requests.post(SB_VERIFY,
+                          json={"vCode": int(code)},
+                          headers=hdrs,
+                          cookies={"token": token_value},
+                          proxies=proxy_r, timeout=25, verify=False)
+        data = r.json() if r.content else {}
+        # SB returns message:false on success
+        if r.status_code == 200 and data.get("message") is False:
+            new_tok = data.get("token", "")
+            if not new_tok:
+                sc = r.headers.get("set-cookie", "")
+                m  = re.search(r"token=([^;]+)", sc)
+                if m: new_tok = m.group(1)
+            return r, True, new_tok or token_value
+        return r, False, token_value
+    except Exception as e:
+        print(f"[sb_verify] error: {e}")
+        return None, False, token_value
+
+def sb_login(email, password, proxy_r=None):
+    """Login to SB. Returns (token, response) or (None, None)."""
+    try:
+        r = requests.post(SB_LOGIN,
+                          json={"login": email, "password": password},
+                          headers=sb_headers(), proxies=proxy_r, timeout=20, verify=False)
+        if r.status_code == 200:
+            data = r.json()
+            token = data.get("token") or data.get("data", {}).get("token", "")
+            return token, r
+    except: pass
+    return None, None
+
+# ── Cookie fabrication (full browser-like set) ────────────────────────────────
+def _rand_ga_id():
+    return f"GA1.2.{random.randint(100000000,999999999)}.{int(time.time())-random.randint(0,86400*30)}"
+
+def _rand_gid():
+    return f"GA1.2.{random.randint(100000000,999999999)}.{int(time.time())}"
+
+def _rand_gpi():
+    uid = "".join(random.choices("0123456789abcdef", k=16))
+    ts = int(time.time()) - random.randint(0, 86400*30)
+    rt = int(time.time())
+    sfx = "".join(random.choices(string.ascii_letters + string.digits + "_-", k=20))
+    return f"UID={uid}:T={ts}:RT={rt}:S=ALNI_{sfx}"
+
+def _rand_eoi():
+    uid = "".join(random.choices("0123456789abcdef", k=16))
+    ts = int(time.time()) - random.randint(0, 86400*30)
+    rt = int(time.time())
+    sfx = "".join(random.choices(string.ascii_letters + string.digits + "_-", k=20))
+    return f"ID={uid}:T={ts}:RT={rt}:S=AA-Afj{sfx}"
+
+def _rand_gads():
+    uid = "".join(random.choices("0123456789abcdef", k=16))
+    ts = int(time.time()) - random.randint(0, 86400*30)
+    rt = int(time.time())
+    sfx = "".join(random.choices(string.ascii_letters + string.digits + "_-", k=20))
+    return f"ID={uid}:T={ts}:RT={rt}:S=ALNI_{sfx}"
+
+def _rand_fcnec():
+    inner = "".join(random.choices(string.ascii_letters + string.digits + "_-", k=80))
+    raw = f'[["AKsRol_{inner}=="]]'
+    return quote(raw)
+
+def _rand_ga6():
+    sess_ts = int(time.time()) - random.randint(0, 3600)
+    cur_ts  = int(time.time())
+    return f"GS2.1.s{sess_ts}$o5$g1$t{cur_ts}$j59$l0$h0"
+
+def _rand_visitor():
+    return hashlib.md5(str(time.time() + random.random()).encode()).hexdigest()
+
+def _rand_ua_cookie():
+    return quote("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+
+def fabricate_full_cookies(token_value, username, verified=True):
+    """Build full browser-like cookie set matching Cookie-Editor export format."""
+    now      = int(time.time())
+    creation = now - random.randint(3600, 86400 * 7)
+    return [
+        {"domain":"scriptblox.com","expirationDate":now+3600,"hostOnly":True,"httpOnly":False,
+         "name":"__scriptblox_ua_","path":"/","sameSite":"no_restriction","secure":True,
+         "session":False,"storeId":None,"value":_rand_ua_cookie()},
+        {"domain":"scriptblox.com","hostOnly":True,"httpOnly":False,"name":"visitor","path":"/",
+         "sameSite":None,"secure":False,"session":True,"storeId":None,"value":_rand_visitor()},
+        {"domain":"scriptblox.com","expirationDate":creation+86400*365,"hostOnly":True,"httpOnly":False,
+         "name":"i18n_redirected","path":"/","sameSite":"lax","secure":False,"session":False,
+         "storeId":None,"value":"en"},
+        {"domain":"scriptblox.com","expirationDate":now+86400*30,"hostOnly":True,"httpOnly":True,
+         "name":"token","path":"/","sameSite":"strict","secure":True,"session":False,
+         "storeId":None,"value":token_value},
+        {"domain":".scriptblox.com","expirationDate":creation+86400*400,"hostOnly":False,"httpOnly":False,
+         "name":"_ga","path":"/","sameSite":None,"secure":False,"session":False,
+         "storeId":None,"value":_rand_ga_id()},
+        {"domain":".scriptblox.com","expirationDate":now+86400,"hostOnly":False,"httpOnly":False,
+         "name":"_gid","path":"/","sameSite":None,"secure":False,"session":False,
+         "storeId":None,"value":_rand_gid()},
+        {"domain":".scriptblox.com","expirationDate":creation+86400*400,"hostOnly":False,"httpOnly":False,
+         "name":"_ga_6BWTBXZCLM","path":"/","sameSite":None,"secure":False,"session":False,
+         "storeId":None,"value":_rand_ga6()},
+        {"domain":".scriptblox.com","expirationDate":creation+86400*390,"hostOnly":False,"httpOnly":False,
+         "name":"__gpi","path":"/","sameSite":"no_restriction","secure":True,"session":False,
+         "storeId":None,"value":_rand_gpi()},
+        {"domain":".scriptblox.com","expirationDate":creation+86400*180,"hostOnly":False,"httpOnly":False,
+         "name":"__eoi","path":"/","sameSite":"no_restriction","secure":True,"session":False,
+         "storeId":None,"value":_rand_eoi()},
+        {"domain":".scriptblox.com","expirationDate":creation+86400*390,"hostOnly":False,"httpOnly":False,
+         "name":"__gads","path":"/","sameSite":"no_restriction","secure":True,"session":False,
+         "storeId":None,"value":_rand_gads()},
+        {"domain":".scriptblox.com","expirationDate":now+86400*390,"hostOnly":False,"httpOnly":False,
+         "name":"FCNEC","path":"/","sameSite":None,"secure":False,"session":False,
+         "storeId":None,"value":_rand_fcnec()},
+    ]
 
 # ── Cookie extraction ─────────────────────────────────────────────────────────
 def parse_set_cookie_header(header):
@@ -626,19 +669,21 @@ def create_account(sess_token, slot):
     proxy_r     = proxy_to_requests(proxy)
     webhook_url = sess["webhook"]
 
-    log_emit(sess_token, f"[#{slot}] setting up email + captcha...", "dim")
+    log_emit(sess_token, f"[#{slot}] creating email + solving captcha...", "dim")
 
-    cookies, csrf = mw_setup()
-    captcha       = solve_turnstile_capsolver()
-    email_addr, _ = mw_get_email(cookies, csrf)
+    # DisMail — no CSRF, proper API
+    dm_uid, email_addr = dm_create_email()
+    captcha = solve_turnstile_capsolver()
 
     if not email_addr or not captcha:
         state["failed"] += 1
-        log_emit(sess_token, f"[#{slot}] x setup failed (email/captcha)", "err")
+        reason = "email" if not email_addr else "captcha"
+        log_emit(sess_token, f"[#{slot}] x setup failed ({reason})", "err")
         return
 
     log_emit(sess_token, f"[#{slot}] submitting signup...", "dim")
 
+    signup_token = ""
     try:
         r = requests.post(SB_SIGNUP, json={
             "email": email_addr, "username": username,
@@ -646,6 +691,7 @@ def create_account(sess_token, slot):
             "terms": True, "captcha": captcha,
         }, headers=sb_headers(), proxies=proxy_r, timeout=30, verify=False)
         resp = r.json() if r.content else {}
+        signup_token = resp.get("token") or resp.get("data", {}).get("token", "")
     except Exception as e:
         state["failed"] += 1
         log_emit(sess_token, f"[#{slot}] x request error: {str(e)[:50]}", "err")
@@ -656,69 +702,60 @@ def create_account(sess_token, slot):
         log_emit(sess_token, f"[#{slot}] x signup failed: {resp.get('message','')}", "err")
         return
 
-    # ── Verification flow ────────────────────────────────────────────────────
-    # Keep signup cookies as fallback
-    signup_cookies_jar = dict(r.cookies)
-    verify_status = "unverified"
-    final_response = r  # use signup response as default source of cookies
+    # Also grab token from Set-Cookie if not in body
+    if not signup_token:
+        for c in r.cookies:
+            if c.name == "token" and c.value:
+                signup_token = c.value
+                break
 
+    if not signup_token:
+        state["failed"] += 1
+        log_emit(sess_token, f"[#{slot}] x no token received from signup", "err")
+        return
+
+    # ── Navigate to verify page (mirrors browser flow) ────────────────────────
+    try:
+        requests.get("https://scriptblox.com/verify?redirect=/",
+                     cookies={"token": signup_token}, headers=sb_headers(),
+                     proxies=proxy_r, timeout=15, verify=False)
+    except: pass
+
+    # ── Poll DisMail for verification code ────────────────────────────────────
     log_emit(sess_token, f"[#{slot}] waiting for verification email...", "dim")
-    code = mw_wait_for_sb_code(cookies, csrf, max_wait=90, poll_interval=4)
+    verify_code = dm_poll_code(dm_uid, timeout=90)
+    verified    = False
+    final_token = signup_token
 
-    if not code:
-        # Try asking SB to resend once, then poll again with shorter window
-        log_emit(sess_token, f"[#{slot}] no email yet - requesting resend...", "dim")
-        sb_resend_code(signup_cookies_jar, email_addr)
-        code = mw_wait_for_sb_code(cookies, csrf, max_wait=45, poll_interval=3)
-
-    if code:
-        log_emit(sess_token, f"[#{slot}] submitting code {code}...", "dim")
-        vr, _info = sb_verify_email(code, email_addr, signup_cookies_jar)
-        if vr is not None:
-            # Verify succeeded. The verify response MAY include fresh cookies;
-            # but to guarantee we get a verified=true JWT, re-login explicitly.
-            lr = sb_login(email_addr, password)
-            if lr is not None:
-                final_response = lr
-                verify_status = "verified"
-                log_emit(sess_token, f"[#{slot}] account verified & re-logged in", "dim")
-            else:
-                # Use verify response cookies — at minimum the JWT should be
-                # re-issued with verified=true on most implementations.
-                final_response = vr
-                verify_status = "verified"
-                log_emit(sess_token, f"[#{slot}] account verified (using verify cookies)", "dim")
+    if verify_code:
+        log_emit(sess_token, f"[#{slot}] submitting code {verify_code}...", "dim")
+        _vr, ok, new_tok = sb_verify_account(verify_code, signup_token, proxy_r)
+        if ok:
+            verified = True
+            final_token = new_tok
+            log_emit(sess_token, f"[#{slot}] account verified!", "dim")
+            # Visit homepage like browser does after verify
+            try:
+                requests.get(f"{SB_HOME}?showWelcome=true",
+                             cookies={"token": final_token}, headers=sb_headers(),
+                             proxies=proxy_r, timeout=15, verify=False)
+            except: pass
         else:
-            log_emit(sess_token, f"[#{slot}] verify endpoint rejected code", "err")
+            log_emit(sess_token, f"[#{slot}] verify rejected - saving unverified", "err")
     else:
-        log_emit(sess_token, f"[#{slot}] no verification code received - saving unverified", "err")
+        log_emit(sess_token, f"[#{slot}] no code received - saving unverified", "err")
 
-    # ── Cookie extraction from final response ────────────────────────────────
-    session_cookies  = extract_session_cookies(final_response)
-    cookies_url      = None
-    cookies_json_str = None
+    verify_status = "verified" if verified else "unverified"
 
-    if session_cookies:
-        cookies_json_str = json.dumps(session_cookies, indent=2)
-        jwt_ok = False
-        jwt_verified = False
-        for c in session_cookies:
-            if c["name"] in ("token", "__scriptblox_validation"):
-                pl = decode_jwt_payload(c["value"])
-                if pl and pl.get("username"):
-                    jwt_ok = True
-                    if pl.get("verified") is True: jwt_verified = True
-                    break
-        if jwt_verified: verify_status = "verified"
-        cookies_url = upload_cookies_to_sourcebin(cookies_json_str)
-        if cookies_url:
-            log_emit(sess_token, f"[#{slot}] cookies uploaded ({len(session_cookies)} cookies, {verify_status})", "dim")
-        else:
-            log_emit(sess_token, f"[#{slot}] {len(session_cookies)} cookies ({verify_status}) - attaching to webhook", "dim")
-        if not jwt_ok:
-            log_emit(sess_token, f"[#{slot}] warning: JWT validation check failed", "err")
+    # ── Fabricate full browser-like cookie set ─────────────────────────────────
+    cookies_data = fabricate_full_cookies(final_token, username, verified=verified)
+    cookies_json_str = json.dumps(cookies_data, indent=2)
+    cookies_url = upload_cookies_to_sourcebin(cookies_json_str)
+
+    if cookies_url:
+        log_emit(sess_token, f"[#{slot}] cookies uploaded ({len(cookies_data)} cookies, {verify_status})", "dim")
     else:
-        log_emit(sess_token, f"[#{slot}] warning: no session cookies returned", "err")
+        log_emit(sess_token, f"[#{slot}] {len(cookies_data)} cookies ({verify_status}) - attaching to webhook", "dim")
 
     webhook_ok = send_webhook(webhook_url, username, password, email_addr,
                               cookies_url, cookies_json_str, verify_status)
