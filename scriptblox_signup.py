@@ -1,4 +1,3 @@
-
 import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
@@ -672,36 +671,54 @@ def send_webhook(webhook_url, username, password, email, cookies_url=None, cooki
     try:
         is_verified = (verify_status == "verified")
 
-        # Clean, solid color palette — no emoji clutter
-        color = 0x00D4FF if is_verified else 0x4A6070  # cyan / muted
-        status_line = "Verified" if is_verified else "Unverified"
+        # Premium solid palette — cyan verified, amber unverified
+        color = 0x00D4FF if is_verified else 0xF5C842
+        status_emoji = "🟢" if is_verified else "🟡"
+        status_line  = "Verified" if is_verified else "Unverified"
+        cookie_state = "ready for import" if is_verified else "session cookies included"
 
+        # Clean 2-column top row, then full-width rows below
         fields = [
-            {"name": "Username",    "value": f"`{username}`",             "inline": True},
-            {"name": "Status",      "value": f"`{status_line}`",          "inline": True},
-            {"name": "Created",     "value": datetime.now(timezone.utc).strftime("%b %d, %Y %H:%M UTC"), "inline": True},
-            {"name": "Email",       "value": f"`{mask_email(email)}`",    "inline": False},
+            {"name": "👤  Username",
+             "value": f"```\n{username}\n```",
+             "inline": True},
+            {"name": f"{status_emoji}  Status",
+             "value": f"```\n{status_line}\n```",
+             "inline": True},
+            {"name": "📧  Email",
+             "value": f"```\n{mask_email(email)}\n```",
+             "inline": False},
         ]
 
         if cookies_url:
             fields.append({
-                "name":  "Session Cookies",
-                "value": f"```json\ncookies.json ready for Cookie-Editor import\n```\n[**Download cookies.json**]({cookies_url})",
+                "name":  "🍪  Session Cookies",
+                "value": (f"> {cookie_state}\n"
+                          f"> Import via **Cookie-Editor** extension\n\n"
+                          f"[📥 **Download cookies.json**]({cookies_url})"),
                 "inline": False,
             })
         else:
             fields.append({
-                "name":  "Session Cookies",
-                "value": "_Attached to this message below._",
+                "name":  "🍪  Session Cookies",
+                "value": f"> {cookie_state}\n> _Attached below as a file._",
                 "inline": False,
             })
 
         embed = {
-            "title":       "KUNI SB GENERATOR",
-            "description": f"A new ScriptBlox account has been delivered.",
+            "author": {
+                "name":     "KUNI · SB GENERATOR",
+                "icon_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
+            },
+            "title":       "✨  New Account Generated",
+            "description": f"A fresh ScriptBlox account is ready for use.\n───────────────────────────",
             "color":       color,
             "fields":      fields,
-            "footer":      {"text": "Kuni Tool  ·  ScriptBlox Auto Generator"},
+            "thumbnail":   {"url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp"},
+            "footer": {
+                "text":     f"Kuni Tool  •  {datetime.now(timezone.utc).strftime('%b %d, %Y  %H:%M UTC')}",
+                "icon_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
+            },
             "timestamp":   datetime.now(timezone.utc).isoformat(),
         }
 
@@ -725,12 +742,28 @@ def send_webhook(webhook_url, username, password, email, cookies_url=None, cooki
 def test_webhook(url):
     try:
         r = requests.post(url, json={
-            "username": "Kuni SB Gen",
+            "username":   "Kuni SB Gen",
+            "avatar_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
             "embeds": [{
-                "title":       "KUNI SB GENERATOR",
-                "description": "Webhook connected successfully.\nYour generated accounts will be delivered here.",
+                "author": {
+                    "name":     "KUNI · SB GENERATOR",
+                    "icon_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
+                },
+                "title":       "✅  Webhook Connected",
+                "description": ("Your webhook is now linked to **Kuni SB Generator**.\n"
+                                "Generated accounts and session cookies will be delivered right here.\n"
+                                "───────────────────────────"),
                 "color":       0x00D4FF,
-                "footer":      {"text": "Kuni Tool  ·  ScriptBlox Auto Generator"},
+                "fields": [
+                    {"name": "🚀  Status",     "value": "```\nOnline\n```",                       "inline": True},
+                    {"name": "🔗  Endpoint",   "value": "```\nscriptblox.com\n```",                "inline": True},
+                    {"name": "📦  Delivery",   "value": "```\nAccount + Cookies\n```",             "inline": True},
+                ],
+                "thumbnail":   {"url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp"},
+                "footer": {
+                    "text":     f"Kuni Tool  •  {datetime.now(timezone.utc).strftime('%b %d, %Y  %H:%M UTC')}",
+                    "icon_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
+                },
                 "timestamp":   datetime.now(timezone.utc).isoformat(),
             }]
         }, proxies=NO_PROXY, timeout=10)
@@ -1104,7 +1137,10 @@ def set_webhook():
 def get_proxies():
     sess = require_http_session()
     if not sess: return jsonify({"ok": False}), 401
-    return jsonify({"ok": True, "count": len(sess["proxies"])})
+    # Determine source: UI-saved vs proxies.txt fallback
+    p = user_proxies_path(sess["license_key"])
+    source = "ui" if p.exists() and p.read_text().strip() else "file"
+    return jsonify({"ok": True, "count": len(sess["proxies"]), "source": source})
 
 @app.route("/get-webhook", methods=["GET"])
 def get_webhook():
@@ -1688,7 +1724,12 @@ async function loadSavedConfig() {
     const d = await r.json();
     if (d.ok) {
       const badge = document.getElementById('proxyBadge');
-      badge.textContent = d.count > 0 ? d.count+' loaded' : 'none';
+      if (d.count > 0) {
+        const src = d.source === 'file' ? ' (proxies.txt)' : '';
+        badge.textContent = d.count + ' loaded' + src;
+      } else {
+        badge.textContent = 'none';
+      }
       badge.className = 'badge'+(d.count>0?' ok':'');
     }
   } catch {}
