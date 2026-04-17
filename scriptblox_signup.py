@@ -1,18 +1,3 @@
-# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.6
-# Deploy on Railway / Render — open http://localhost:5000
-#
-# v2.6 changelog:
-#   • Multi-user session isolation (per-license state, webhook, proxies)
-#   • Rate limiting on /verify-key
-#   • Email domain masking in Discord webhook (privacy)
-#   • Enhanced fingerprinting: canvas + audio + WebGL + fonts
-#   • Datacenter/VPN IP detection for trial abuse
-#   • Server-side UA consistency verification
-#   • Atomic counter with TOCTOU-safe retry loop
-#   • JWT exp parsing → accurate cookie expiry
-#   • SocketIO auth middleware (all events require valid session)
-#   • Subnet-level trial blocking (/16 + /24)
-#   • Live license re-check before every batch start
 
 import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
@@ -95,9 +80,28 @@ def save_user_webhook(license_key, wh):
     user_webhook_path(license_key).write_text(wh or "")
 
 def load_user_proxies(license_key):
+    # ── Priority 1: Proxies from UI (per-user file) ──
     p = user_proxies_path(license_key)
-    if not p.exists(): return []
-    return [l.strip() for l in p.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    if p.exists():
+        proxies = [l.strip() for l in p.read_text().splitlines() 
+                   if l.strip() and not l.startswith("#")]
+        if proxies:
+            return proxies
+
+    global_proxy_file = Path(__file__).parent / "proxies.txt"
+    if global_proxy_file.exists():
+        try:
+            proxies = [l.strip() for l in global_proxy_file.read_text().splitlines() 
+                       if l.strip() and not l.startswith("#")]
+            if proxies:
+                print(f"[PROXIES] Loaded {len(proxies)} proxies from proxies.txt")
+                return proxies
+        except Exception as e:
+            print(f"[PROXIES] Error reading proxies.txt: {e}")
+
+    
+    print("[PROXIES] No proxies found in UI or proxies.txt")
+    return []
 
 def save_user_proxies(license_key, lines):
     user_proxies_path(license_key).write_text("\n".join(lines))
