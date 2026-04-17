@@ -1,7 +1,21 @@
-# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.5
+# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.6
 # Deploy on Railway / Render — open http://localhost:5000
+#
+# v2.6 changelog:
+#   • Multi-user session isolation (per-license state, webhook, proxies)
+#   • Rate limiting on /verify-key and /claim-trial
+#   • Email domain masking in Discord webhook (privacy)
+#   • Enhanced fingerprinting: canvas + audio + WebGL + fonts
+#   • Datacenter/VPN IP detection for trial abuse
+#   • Server-side UA consistency verification
+#   • Atomic counter with TOCTOU-safe retry loop
+#   • JWT exp parsing → accurate cookie expiry
+#   • SocketIO auth middleware (all events require valid session)
+#   • Subnet-level trial blocking (/16 + /24)
+#   • Live license re-check before every batch start
 
-import json, os, random, re, string, threading, hashlib, secrets
+import json, os, random, re, string, threading, hashlib, secrets, time, base64
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import unquote
@@ -11,7 +25,7 @@ urllib3.disable_warnings()
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, disconnect
 
 from turnstile_solver import solve_turnstile_capsolver
 from proxy_util import load_proxies, get_random_proxy, parse_proxy
@@ -25,31 +39,182 @@ SB_SIGNUP     = "https://scriptblox.com/api/auth/signup"
 MW_DOMAIN     = "aula.edu.pl"
 MW_BASE       = "https://mailwave.dev"
 NO_PROXY      = {"http": None, "https": None}
-ACCOUNTS_FILE = Path(__file__).parent / "scriptblox_accounts.txt"
-PROXIES_FILE  = Path(__file__).parent / "proxies.txt"
-WEBHOOK_FILE  = Path(__file__).parent / "webhook.txt"
 
-# ── State ─────────────────────────────────────────────────────────────────────
-proxies_list   = load_proxies()
-active_webhook = ""
-license_valid  = False
-current_key    = None
-license_record = None
-session_lock   = threading.Lock()
-file_lock      = threading.Lock()
-counter_lock   = threading.Lock()  # NEW: atomic counter operations
+USER_DATA_DIR = Path(__file__).parent / "user_data"
+USER_DATA_DIR.mkdir(exist_ok=True)
 
-if WEBHOOK_FILE.exists():
-    active_webhook = WEBHOOK_FILE.read_text().strip()
+SESSION_TTL_SEC = 86400
+LICENSE_RECHECK_SEC = 300
+
+RL_VERIFY_MAX, RL_VERIFY_WIN = 10, 60
+RL_TRIAL_MAX,  RL_TRIAL_WIN  = 3,  3600
+
+# ── Global State (thread-safe) ────────────────────────────────────────────────
+sessions       = {}
+sid_to_token   = {}
+sessions_lock  = threading.RLock()
+
+rate_limits    = defaultdict(deque)
+rl_lock        = threading.Lock()
+
+counter_lock   = threading.Lock()
 
 app      = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-state = {"running": False, "created": 0, "active": 0, "failed": 0, "target": 0, "stop": False}
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+def rate_limit(key, max_hits, window_sec):
+    with rl_lock:
+        now = time.time()
+        dq  = rate_limits[key]
+        while dq and dq[0] < now - window_sec: dq.popleft()
+        if len(dq) >= max_hits: return False
+        dq.append(now)
+        return True
+
+# ── Session management ────────────────────────────────────────────────────────
+def fresh_state():
+    return {"running": False, "created": 0, "active": 0, "failed": 0,
+            "target": 0, "stop": False, "last_license_check": 0}
+
+def user_key_hash(license_key):
+    return hashlib.sha256(license_key.encode()).hexdigest()[:20]
+
+def user_webhook_path(license_key):  return USER_DATA_DIR / f"{user_key_hash(license_key)}.webhook"
+def user_proxies_path(license_key):  return USER_DATA_DIR / f"{user_key_hash(license_key)}.proxies"
+def user_accounts_path(license_key): return USER_DATA_DIR / f"{user_key_hash(license_key)}.accounts.jsonl"
+
+def load_user_webhook(license_key):
+    p = user_webhook_path(license_key)
+    return p.read_text().strip() if p.exists() else ""
+
+def save_user_webhook(license_key, wh):
+    user_webhook_path(license_key).write_text(wh or "")
+
+def load_user_proxies(license_key):
+    p = user_proxies_path(license_key)
+    if not p.exists(): return []
+    return [l.strip() for l in p.read_text().splitlines() if l.strip() and not l.startswith("#")]
+
+def save_user_proxies(license_key, lines):
+    user_proxies_path(license_key).write_text("\n".join(lines))
+
+def create_session(license_key, license_record, ip, ua_hash_val):
+    token = secrets.token_urlsafe(32)
+    with sessions_lock:
+        sessions[token] = {
+            "license_key":    license_key,
+            "license_record": license_record,
+            "webhook":        load_user_webhook(license_key),
+            "proxies":        load_user_proxies(license_key),
+            "state":          fresh_state(),
+            "ip":             ip,
+            "ua_hash":        ua_hash_val,
+            "created_at":     time.time(),
+            "last_seen":      time.time(),
+            "file_lock":      threading.Lock(),
+        }
+    return token
+
+def get_session_by_token(token):
+    if not token: return None
+    with sessions_lock:
+        sess = sessions.get(token)
+        if sess: sess["last_seen"] = time.time()
+        return sess
+
+def destroy_session(token):
+    with sessions_lock:
+        sessions.pop(token, None)
+        dead = [sid for sid, t in sid_to_token.items() if t == token]
+        for sid in dead: sid_to_token.pop(sid, None)
+
+def cleanup_sessions_loop():
+    while True:
+        time.sleep(300)
+        try:
+            with sessions_lock:
+                now = time.time()
+                expired = [t for t, s in sessions.items() if now - s["last_seen"] > SESSION_TTL_SEC]
+                for t in expired: sessions.pop(t, None)
+                dead_sids = [sid for sid, t in sid_to_token.items() if t not in sessions]
+                for sid in dead_sids: sid_to_token.pop(sid, None)
+        except: pass
+
+threading.Thread(target=cleanup_sessions_loop, daemon=True).start()
+
+def require_http_session():
+    body = request.json if request.is_json else {}
+    token = (request.headers.get("X-Session-Token") or
+             (body or {}).get("session_token", "")).strip()
+    return get_session_by_token(token)
+
+def socket_session():
+    sid = getattr(request, "sid", None)
+    token = sid_to_token.get(sid) if sid else None
+    return get_session_by_token(token)
+
+# ── Client identity helpers ───────────────────────────────────────────────────
+def get_client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd: return fwd.split(",")[0].strip()
+    return request.headers.get("X-Real-IP") or request.remote_addr or "0.0.0.0"
+
+def get_client_ua():
+    return (request.headers.get("User-Agent") or "")[:500]
+
+def ua_hash(ua):
+    return hashlib.sha256((ua or "").encode()).hexdigest()[:20]
+
+def ip_subnet(ip, octets=3):
+    parts = ip.split(".")
+    if len(parts) != 4: return ip
+    try:
+        for p in parts: int(p)
+    except: return ip
+    return ".".join(parts[:octets])
+
+DATACENTER_PREFIXES = (
+    "104.16.","104.17.","104.18.","104.19.","104.20.","104.21.","104.22.","104.23.",
+    "104.24.","104.25.","104.26.","104.27.","104.28.","172.67.","172.68.","172.69.",
+    "172.70.","188.114.",
+    "34.","35.192.","35.193.","35.194.","35.195.","35.196.","35.197.","35.198.",
+    "35.199.","35.200.","35.201.","35.202.","35.203.","35.204.","35.205.","35.206.",
+    "35.207.","35.208.","35.209.","35.210.","35.211.","35.212.","35.213.","35.214.",
+    "35.215.","35.216.","35.217.","35.218.","35.219.","35.220.","35.221.","35.222.",
+    "35.223.","35.224.","35.225.","35.226.","35.227.","35.228.","35.229.","35.230.",
+    "35.231.","35.232.","35.233.","35.234.","35.235.","35.236.","35.237.","35.238.",
+    "35.239.","35.240.","35.241.","35.242.","35.243.","35.244.","35.245.","35.246.",
+    "35.247.","35.248.","35.249.",
+    "52.","54.","18.","3.",
+    "157.90.","159.69.","95.216.","116.202.","168.119.","142.132.",
+    "46.101.","159.89.","165.227.","134.209.","167.99.","138.197.","138.68.",
+    "159.203.","178.62.",
+    "45.76.","45.77.","108.61.","149.28.","155.138.","207.148.","66.42.","45.32.",
+    "185.244.","185.159.","185.232.","185.220.",
+    "89.187.","193.32.","185.65.","185.107.",
+)
+def is_datacenter_ip(ip):
+    if not ip or "." not in ip: return False
+    for prefix in DATACENTER_PREFIXES:
+        if ip.startswith(prefix): return True
+    return False
+
+def combined_fingerprint(hwid, ip, ls_token, ua_hash_val, extra_fp=""):
+    ip_pref = ip_subnet(ip, 3) if "." in ip else ip[:8]
+    raw = f"{hwid}|{ip_pref}|{ls_token or ''}|{ua_hash_val}|{extra_fp or ''}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def mask_email(email):
+    if not email or "@" not in email: return "***"
+    user = email.split("@")[0]
+    if len(user) > 3: user = user[:2] + "*" * (len(user) - 2)
+    return f"{user}@***"
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
 def supa_hdrs():
-    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"}
 
 def fetch_license(key):
     try:
@@ -58,39 +223,34 @@ def fetch_license(key):
         if r.status_code == 200:
             d = r.json()
             return d[0] if d else None
-    except:
-        pass
+    except: pass
     return None
 
-def increment_used(key):
-    """Atomic increment. Returns new value or None on fail. Only call AFTER confirmed signup."""
+def atomic_increment_used(key, limit):
+    """Optimistic-lock increment. Returns (new_value, allowed)."""
     with counter_lock:
-        try:
-            rec = fetch_license(key)
-            if not rec: return None
-            new_val = (rec.get("accounts_used") or 0) + 1
-            r = requests.patch(f"{SUPABASE_URL}/rest/v1/licenses",
-                               headers={**supa_hdrs(), "Prefer": "return=representation"},
-                               params={"license_key": f"eq.{key}"},
-                               json={"accounts_used": new_val})
-            return new_val if r.status_code in (200, 201) else None
-        except:
-            return None
-
-def get_client_ip():
-    """Get real client IP, respecting proxies."""
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd: return fwd.split(",")[0].strip()
-    return request.headers.get("X-Real-IP") or request.remote_addr or "0.0.0.0"
-
-def get_hwid(ip):
-    return hashlib.sha256(ip.encode()).hexdigest()
-
-def compute_combined_fp(hwid, ip, ls_token):
-    """Combined fingerprint: HWID + IP prefix + localStorage token."""
-    ip_prefix = ".".join(ip.split(".")[:3]) if "." in ip else ip[:8]  # /24 subnet for IPv4
-    raw = f"{hwid}|{ip_prefix}|{ls_token or ''}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+        for attempt in range(3):
+            try:
+                rec = fetch_license(key)
+                if not rec: return (None, False)
+                used  = rec.get("accounts_used") or 0
+                if limit < 9999 and used >= limit:
+                    return (used, False)
+                new_val = used + 1
+                r = requests.patch(f"{SUPABASE_URL}/rest/v1/licenses",
+                                   headers={**supa_hdrs(), "Prefer": "return=representation"},
+                                   params={"license_key": f"eq.{key}",
+                                           "accounts_used": f"eq.{used}"},
+                                   json={"accounts_used": new_val})
+                if r.status_code in (200, 201):
+                    body = r.json()
+                    if body:
+                        return (new_val, True)
+                time.sleep(0.1 * (attempt + 1))
+            except Exception as e:
+                print("INCREMENT ERROR:", e)
+                time.sleep(0.1)
+        return (None, False)
 
 # ── MailWave ──────────────────────────────────────────────────────────────────
 def mw_setup():
@@ -107,7 +267,8 @@ def mw_get_email(cookies, csrf):
     for _ in range(20):
         alias = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         try:
-            r = requests.post(f"{MW_BASE}/change", data={"_token": csrf, "name": alias, "domain": MW_DOMAIN},
+            r = requests.post(f"{MW_BASE}/change",
+                              data={"_token": csrf, "name": alias, "domain": MW_DOMAIN},
                               cookies=cookies, proxies=NO_PROXY, timeout=15)
             cookies.update(dict(r.cookies))
             new_csrf = unquote(cookies.get("XSRF-TOKEN", csrf))
@@ -116,40 +277,28 @@ def mw_get_email(cookies, csrf):
                                cookies=cookies, proxies=NO_PROXY, timeout=15)
             mailbox = r2.json().get("mailbox", "")
             if MW_DOMAIN in mailbox: return mailbox, new_csrf
-        except:
-            pass
+        except: pass
     return None, csrf
 
-# ── Cookie extraction from signup response ───────────────────────────────────
+# ── Cookie extraction ─────────────────────────────────────────────────────────
 def parse_set_cookie_header(header):
-    """Parse a single Set-Cookie header string into Cookie-Editor format."""
     if not header: return None
     parts = header.split(';')
     if not parts: return None
-
-    # First part is name=value
     nv = parts[0].strip().split('=', 1)
     if len(nv) != 2: return None
     name, value = nv[0].strip(), nv[1].strip()
     if not name: return None
 
     cookie = {
-        "domain":   "scriptblox.com",
-        "hostOnly": True,
-        "httpOnly": False,
-        "name":     name,
-        "path":     "/",
-        "sameSite": None,
-        "secure":   False,
-        "session":  True,
-        "storeId":  None,
-        "value":    value,
+        "domain": "scriptblox.com", "hostOnly": True, "httpOnly": False,
+        "name": name, "path": "/", "sameSite": None, "secure": False,
+        "session": True, "storeId": None, "value": value,
     }
 
     for attr in parts[1:]:
         attr  = attr.strip()
         lower = attr.lower()
-
         if lower.startswith('domain='):
             d = attr.split('=', 1)[1].strip()
             cookie["domain"]   = d
@@ -162,160 +311,128 @@ def parse_set_cookie_header(header):
                 dt = parsedate_to_datetime(attr.split('=', 1)[1].strip())
                 cookie["expirationDate"] = dt.timestamp()
                 cookie["session"] = False
-            except:
-                pass
+            except: pass
         elif lower.startswith('max-age='):
             try:
                 age = int(attr.split('=', 1)[1].strip())
                 cookie["expirationDate"] = datetime.now(timezone.utc).timestamp() + age
                 cookie["session"] = False
-            except:
-                pass
+            except: pass
         elif lower.startswith('samesite='):
             ss = attr.split('=', 1)[1].strip().lower()
             if ss == 'none': cookie["sameSite"] = "no_restriction"
             elif ss in ('lax', 'strict'): cookie["sameSite"] = ss
-        elif lower == 'secure':
-            cookie["secure"] = True
-        elif lower == 'httponly':
-            cookie["httpOnly"] = True
-
+        elif lower == 'secure':   cookie["secure"]   = True
+        elif lower == 'httponly': cookie["httpOnly"] = True
     return cookie
 
 def get_all_set_cookie_headers(response):
-    """Get all Set-Cookie header values from response (can be multiple)."""
     headers = []
     try:
-        # urllib3 HTTPResponse has a headers object with get_all/getlist
         raw_headers = getattr(response.raw, 'headers', None)
         if raw_headers:
             if hasattr(raw_headers, 'get_all'):
                 headers = raw_headers.get_all('Set-Cookie') or []
             elif hasattr(raw_headers, 'getlist'):
                 headers = raw_headers.getlist('Set-Cookie') or []
-    except:
-        pass
-
-    # Fallback: requests' merged headers (comma-joined, can be tricky to split)
+    except: pass
     if not headers:
         merged = response.headers.get('Set-Cookie', '')
         if merged:
-            # Split carefully — commas can appear inside expires= dates
-            # Use regex to split on ", " that precedes a cookie-name=value pattern
             headers = re.split(r',\s*(?=[A-Za-z_][A-Za-z0-9_\-]*=)', merged)
-
     return headers
 
-def extract_session_cookies(response, resp_json=None):
-    """Extract full session cookies from SB signup response in Cookie-Editor format."""
+def decode_jwt_payload(jwt_str):
+    try:
+        parts = jwt_str.split('.')
+        if len(parts) < 2: return None
+        payload = parts[1]
+        payload += '=' * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except:
+        return None
+
+def extract_session_cookies(response):
     raw_headers = get_all_set_cookie_headers(response)
     cookies = []
     seen = set()
-
     for h in raw_headers:
         parsed = parse_set_cookie_header(h)
         if not parsed: continue
-        # Dedupe by (name, domain)
-        key = (parsed["name"], parsed["domain"])
-        if key in seen: continue
-        seen.add(key)
+        k = (parsed["name"], parsed["domain"])
+        if k in seen: continue
+        seen.add(k)
+        if parsed["name"] in ("token", "__scriptblox_validation") and parsed.get("session"):
+            payload = decode_jwt_payload(parsed["value"])
+            if payload and payload.get("exp"):
+                parsed["expirationDate"] = float(payload["exp"])
+                parsed["session"] = False
         cookies.append(parsed)
-
-    # Fallback: if no Set-Cookie headers parsed, rebuild from requests cookie jar
     if not cookies:
         for c in response.cookies:
             domain = c.domain or "scriptblox.com"
             cookie = {
-                "domain":   domain,
-                "hostOnly": not domain.startswith('.'),
-                "httpOnly": bool(c._rest.get('HttpOnly')) if hasattr(c, '_rest') else False,
-                "name":     c.name,
-                "path":     c.path or "/",
-                "sameSite": "lax",
-                "secure":   bool(c.secure),
-                "session":  c.expires is None,
-                "storeId":  None,
-                "value":    c.value,
+                "domain": domain, "hostOnly": not domain.startswith('.'),
+                "httpOnly": False, "name": c.name, "path": c.path or "/",
+                "sameSite": "lax", "secure": bool(c.secure),
+                "session": c.expires is None, "storeId": None, "value": c.value,
             }
-            if c.expires:
-                cookie["expirationDate"] = float(c.expires)
+            if c.expires: cookie["expirationDate"] = float(c.expires)
             cookies.append(cookie)
-
     return cookies
 
-def decode_jwt_payload(jwt_str):
-    """Decode JWT payload without verification — just to extract user info for logging."""
-    try:
-        import base64
-        parts = jwt_str.split('.')
-        if len(parts) < 2: return None
-        payload = parts[1]
-        # Pad base64
-        payload += '=' * (-len(payload) % 4)
-        decoded = base64.urlsafe_b64decode(payload)
-        return json.loads(decoded)
-    except:
-        return None
-
 def upload_cookies_to_sourcebin(cookies_json):
-    """Upload cookies.json to sourceb.in and return the URL."""
     try:
         r = requests.post("https://sourceb.in/api/bins",
                           json={"files": [{"name": "cookies.json", "content": cookies_json}]},
                           timeout=15, proxies=NO_PROXY)
         if r.status_code in (200, 201):
             data = r.json()
-            key = data.get("key") or data.get("bin", {}).get("key")
+            key = data.get("key") or (data.get("bin") or {}).get("key")
             if key: return f"https://cdn.sourceb.in/bins/{key}/0"
-    except:
-        pass
+    except: pass
     return None
 
 # ── Discord Webhook ───────────────────────────────────────────────────────────
-def send_webhook(username, password, email, cookies_url=None, cookies_json=None):
-    if not active_webhook: return False
+def send_webhook(webhook_url, username, password, email, cookies_url=None, cookies_json=None):
+    if not webhook_url: return False
     try:
         fields = [
-            {"name": "👤 Username", "value": f"```{username}```", "inline": True},
-            {"name": "🔑 Password", "value": f"```{password}```", "inline": True},
-            {"name": "📧 Email",    "value": f"```{email}```",    "inline": False},
-            {"name": "📅 Created",  "value": datetime.now(timezone.utc).strftime("%b %d, %Y"), "inline": True},
-            {"name": "⚡ Status",   "value": "✅ Verified" if cookies_url else "⚠️ Unverified", "inline": True},
+            {"name": "\U0001F464 Username", "value": f"```{username}```", "inline": True},
+            {"name": "\U0001F511 Password", "value": f"```{password}```", "inline": True},
+            {"name": "\U0001F4E7 Email",    "value": f"```{mask_email(email)}```", "inline": False},
+            {"name": "\U0001F4C5 Created",  "value": datetime.now(timezone.utc).strftime("%b %d, %Y"), "inline": True},
+            {"name": "\u26A1 Status",       "value": "\u2705 Verified" if cookies_url else "\u26A0\uFE0F Unverified", "inline": True},
         ]
         if cookies_url:
-            fields.append({"name": "🍪 Cookies", "value": f"[cookies.json]({cookies_url})", "inline": False})
-
+            fields.append({"name": "\U0001F36A Cookies", "value": f"[cookies.json]({cookies_url})", "inline": False})
         embed = {
-            "title": "🎯 New Account Generated",
+            "title": "\U0001F3AF New Account Generated",
             "color": 0x00ffcc,
-            "description": f"**{username}** | {email}",
+            "description": f"**{username}**",
             "fields": fields,
-            "footer": {"text": "Kuni SB Generator · v2.5"},
+            "footer": {"text": "Kuni SB Generator \u00B7 v2.6"},
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-
         payload = {"embeds": [embed]}
-        files = None
         if cookies_json and not cookies_url:
-            # Attach as file if sourcebin failed
             files = {"cookies.json": ("cookies.json", cookies_json, "application/json")}
-            r = requests.post(active_webhook, data={"payload_json": json.dumps(payload)},
+            r = requests.post(webhook_url, data={"payload_json": json.dumps(payload)},
                               files=files, proxies=NO_PROXY, timeout=15)
         else:
-            r = requests.post(active_webhook, json=payload, proxies=NO_PROXY, timeout=10)
+            r = requests.post(webhook_url, json=payload, proxies=NO_PROXY, timeout=10)
         return r.status_code in (200, 204)
     except:
         return False
 
 def test_webhook(url):
-    """Quick ping to verify webhook is alive."""
     try:
         r = requests.post(url, json={
             "embeds": [{
-                "title": "✅ Kuni Webhook Connected",
+                "title": "\u2705 Kuni Webhook Connected",
                 "description": "Your webhook is working. Accounts will be delivered here.",
                 "color": 0x00ffcc,
-                "footer": {"text": "Kuni SB Generator · v2.5"},
+                "footer": {"text": "Kuni SB Generator \u00B7 v2.6"},
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }]
         }, proxies=NO_PROXY, timeout=10)
@@ -343,36 +460,65 @@ def sb_headers():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143.0.0.0 Safari/537.36",
     }
 
-def log_emit(msg, tag="info"):
+def log_emit(sess_token, msg, tag="info"):
     ts = datetime.now().strftime("%H:%M:%S")
-    socketio.emit("log", {"msg": f"[{ts}] {msg}", "tag": tag})
-    socketio.emit("stats", {k: state[k] for k in ("created","active","failed","target")})
+    sess = get_session_by_token(sess_token)
+    if not sess: return
+    with sessions_lock:
+        sids = [sid for sid, t in sid_to_token.items() if t == sess_token]
+    payload_log   = {"msg": f"[{ts}] {msg}", "tag": tag}
+    payload_stats = {k: sess["state"][k] for k in ("created","active","failed","target")}
+    for sid in sids:
+        socketio.emit("log",   payload_log,   room=sid)
+        socketio.emit("stats", payload_stats, room=sid)
+
+def emit_to_session(sess_token, event, data):
+    with sessions_lock:
+        sids = [sid for sid, t in sid_to_token.items() if t == sess_token]
+    for sid in sids:
+        socketio.emit(event, data, room=sid)
 
 # ── Core account creation ─────────────────────────────────────────────────────
-def create_account(slot):
-    global current_key, license_record
+def create_account(sess_token, slot):
+    sess = get_session_by_token(sess_token)
+    if not sess: return
+    state = sess["state"]
     if state["stop"]: return
 
-    # Pre-check limit atomically
-    if license_record:
-        limit = license_record.get("accounts_limit", 0)
-        if limit < 9999:
-            with counter_lock:
-                rec = fetch_license(current_key)
-                if rec:
-                    used = rec.get("accounts_used") or 0
-                    if used >= limit:
-                        state["stop"] = True
-                        log_emit(f"Account limit reached ({used}/{limit}) — stopping", "err")
-                        socketio.emit("limit_reached", {"used": used, "limit": limit})
-                        return
+    license_key    = sess["license_key"]
+    license_record = sess["license_record"]
+    limit = license_record.get("accounts_limit", 0) if license_record else 0
 
-    username = rand_username()
-    password = rand_password()
-    proxy    = get_random_proxy(proxies_list)
-    proxy_r  = proxy_to_requests(proxy)
+    now = time.time()
+    if now - state["last_license_check"] > LICENSE_RECHECK_SEC:
+        fresh = fetch_license(license_key)
+        if not fresh or fresh.get("status") != "active":
+            state["stop"] = True
+            log_emit(sess_token, "License revoked or disabled - stopping.", "err")
+            emit_to_session(sess_token, "limit_reached", {"used": 0, "limit": limit, "reason": "revoked"})
+            return
+        exp = fresh.get("expiry_date")
+        if exp:
+            try:
+                exp_dt = datetime.fromisoformat(exp.replace("Z","+00:00"))
+                if exp_dt.tzinfo is None: exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if exp_dt < datetime.now(timezone.utc):
+                    state["stop"] = True
+                    log_emit(sess_token, "License expired - stopping.", "err")
+                    emit_to_session(sess_token, "limit_reached", {"used": 0, "limit": limit, "reason": "expired"})
+                    return
+            except: pass
+        sess["license_record"] = fresh
+        license_record = fresh
+        state["last_license_check"] = now
 
-    log_emit(f"[#{slot}] setting up email + captcha...", "dim")
+    username    = rand_username()
+    password    = rand_password()
+    proxy       = get_random_proxy(sess["proxies"]) if sess["proxies"] else None
+    proxy_r     = proxy_to_requests(proxy)
+    webhook_url = sess["webhook"]
+
+    log_emit(sess_token, f"[#{slot}] setting up email + captcha...", "dim")
 
     cookies, csrf = mw_setup()
     captcha       = solve_turnstile_capsolver()
@@ -380,12 +526,11 @@ def create_account(slot):
 
     if not email_addr or not captcha:
         state["failed"] += 1
-        log_emit(f"[#{slot}] ✗ setup failed (email/captcha)", "err")
-        return  # no rollback needed — never incremented
+        log_emit(sess_token, f"[#{slot}] x setup failed (email/captcha)", "err")
+        return
 
-    log_emit(f"[#{slot}] submitting signup...", "dim")
+    log_emit(sess_token, f"[#{slot}] submitting signup...", "dim")
 
-    # Attempt signup
     try:
         r = requests.post(SB_SIGNUP, json={
             "email": email_addr, "username": username,
@@ -395,99 +540,106 @@ def create_account(slot):
         resp = r.json() if r.content else {}
     except Exception as e:
         state["failed"] += 1
-        log_emit(f"[#{slot}] ✗ request error: {str(e)[:50]}", "err")
+        log_emit(sess_token, f"[#{slot}] x request error: {str(e)[:50]}", "err")
         return
 
-    # Validate response
     if resp.get("error") or (isinstance(resp.get("statusCode"), int) and resp["statusCode"] >= 400):
         state["failed"] += 1
-        log_emit(f"[#{slot}] ✗ signup failed: {resp.get('message','')}", "err")
+        log_emit(sess_token, f"[#{slot}] x signup failed: {resp.get('message','')}", "err")
         return
 
-    # Extract cookies/tokens
-    session_cookies = extract_session_cookies(r, resp)
-    cookies_url = None
+    session_cookies  = extract_session_cookies(r)
+    cookies_url      = None
     cookies_json_str = None
-    jwt_verified = False
 
     if session_cookies:
         cookies_json_str = json.dumps(session_cookies, indent=2)
-
-        # Verify we got a valid JWT (confirms signup actually worked)
+        jwt_ok = False
         for c in session_cookies:
             if c["name"] in ("token", "__scriptblox_validation"):
-                payload = decode_jwt_payload(c["value"])
-                if payload and payload.get("username"):
-                    jwt_verified = True
-                    break
-
+                pl = decode_jwt_payload(c["value"])
+                if pl and pl.get("username"): jwt_ok = True; break
         cookies_url = upload_cookies_to_sourcebin(cookies_json_str)
         if cookies_url:
-            log_emit(f"[#{slot}] 🍪 cookies uploaded ({len(session_cookies)} cookies) → {cookies_url}", "dim")
+            log_emit(sess_token, f"[#{slot}] cookies uploaded ({len(session_cookies)} cookies)", "dim")
         else:
-            log_emit(f"[#{slot}] 🍪 cookies extracted ({len(session_cookies)}) — sourcebin failed, will attach to webhook", "dim")
+            log_emit(sess_token, f"[#{slot}] {len(session_cookies)} cookies - attaching to webhook", "dim")
+        if not jwt_ok:
+            log_emit(sess_token, f"[#{slot}] warning: JWT validation check failed", "err")
     else:
-        log_emit(f"[#{slot}] ⚠ no session cookies in response — signup may have failed silently", "err")
+        log_emit(sess_token, f"[#{slot}] warning: no session cookies returned", "err")
 
-    # Send webhook FIRST — if this fails, still save locally but warn
-    webhook_ok = send_webhook(username, password, email_addr, cookies_url, cookies_json_str)
+    webhook_ok = send_webhook(webhook_url, username, password, email_addr,
+                              cookies_url, cookies_json_str)
     if not webhook_ok:
-        log_emit(f"[#{slot}] ⚠ webhook delivery failed — account saved locally only", "err")
+        log_emit(sess_token, f"[#{slot}] warning: webhook delivery failed - saved locally", "err")
 
-    # Save to file
     account = {
-        "username": username, "password": password, "email": email_addr,
+        "username": username, "password": password,
+        "email": email_addr,
         "cookies_url": cookies_url, "has_session": bool(session_cookies),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    with file_lock:
-        with open(ACCOUNTS_FILE, "a") as f:
+    with sess["file_lock"]:
+        with open(user_accounts_path(license_key), "a") as f:
             f.write(json.dumps(account) + "\n")
 
-    # Increment counter ONLY after confirmed success
-    with session_lock:
-        increment_used(current_key)
+    new_used, allowed = atomic_increment_used(license_key, limit)
+    if not allowed:
+        state["stop"] = True
+        log_emit(sess_token, f"Account limit reached during run ({new_used}/{limit})", "err")
+        emit_to_session(sess_token, "limit_reached", {"used": new_used, "limit": limit})
+        return
 
     state["created"] += 1
-    verified_mark = "🍪" if cookies_url else "✓"
-    log_emit(f"[#{slot}] {verified_mark} {username} | {password}", "ok")
+    mark = "[COOKIE]" if cookies_url else "[OK]"
+    log_emit(sess_token, f"[#{slot}] {mark} {username} | {password}", "ok")
 
-def run_generator(count, concurrent):
+def run_generator(sess_token, count, concurrent):
+    sess = get_session_by_token(sess_token)
+    if not sess: return
+    state = sess["state"]
+
     sem = threading.Semaphore(concurrent)
     threads = []
+
     def worker(slot):
         with sem:
             if not state["stop"]:
                 state["active"] += 1
-                try:
-                    create_account(slot)
-                finally:
-                    state["active"] -= 1
+                try: create_account(sess_token, slot)
+                finally: state["active"] -= 1
+
     for i in range(count):
         if state["stop"]: break
         t = threading.Thread(target=worker, args=(i+1,), daemon=True)
         threads.append(t); t.start()
     for t in threads: t.join()
-    state["running"] = False
-    log_emit(f"Done — {state['created']}/{count} accounts created.", "ok")
-    socketio.emit("done", {"created": state["created"], "total": count})
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+    state["running"] = False
+    log_emit(sess_token, f"Done - {state['created']}/{count} accounts created.", "ok")
+    emit_to_session(sess_token, "done", {"created": state["created"], "total": count})
+
+# ── HTTP Routes ───────────────────────────────────────────────────────────────
 @app.route("/verify-key", methods=["POST"])
 def verify():
-    global license_valid, current_key, license_record
+    client_ip = get_client_ip()
+    if not rate_limit(f"verify:{client_ip}", RL_VERIFY_MAX, RL_VERIFY_WIN):
+        return jsonify({"valid": False, "error": "rate_limited"}), 429
     try:
         body = request.json or {}
         key = body.get("key","").strip()
         if not key: return jsonify({"valid": False, "error": "no_key"})
 
         client_hwid = body.get("hwid", "").strip()
-        client_ip   = get_client_ip()
         ls_token    = body.get("ls_token", "").strip()
-
-        hwid = client_hwid if client_hwid else get_hwid(client_ip)
+        extra_fp    = body.get("fp", "").strip()
+        ua          = get_client_ua()
+        ua_h        = ua_hash(ua)
+        hwid        = client_hwid or hashlib.sha256(client_ip.encode()).hexdigest()
 
         rec = fetch_license(key)
-        if not rec:  return jsonify({"valid": False, "error": "not_found"})
+        if not rec: return jsonify({"valid": False, "error": "not_found"})
         if rec.get("status") != "active": return jsonify({"valid": False, "error": "disabled"})
 
         exp = rec.get("expiry_date")
@@ -497,45 +649,46 @@ def verify():
                 if exp_dt.tzinfo is None: exp_dt = exp_dt.replace(tzinfo=timezone.utc)
                 if exp_dt < datetime.now(timezone.utc):
                     return jsonify({"valid": False, "error": "expired"})
-            except:
-                pass
+            except: pass
 
-        # HWID check — strict for all keys, especially trials
         if rec.get("hwid") and rec["hwid"] != hwid:
             return jsonify({"valid": False, "error": "hwid_mismatch"})
 
-        # Extra trial protection: check combined fingerprint match
-        if rec.get("is_trial"):
-            stored_fp = rec.get("combined_fp")
-            current_fp = compute_combined_fp(hwid, client_ip, ls_token)
-            if stored_fp and stored_fp != current_fp:
-                # IP changed or localStorage cleared — still allow if HWID matches,
-                # but flag this as suspicious for logs
-                print(f"[TRIAL] fp drift for {key}: {stored_fp[:8]}... → {current_fp[:8]}...")
-
-        # Bind HWID if first use
-        if not rec.get("hwid"):
-            patch_body = {"hwid": hwid}
+        stored_ua = rec.get("ua_hash")
+        if stored_ua and stored_ua != ua_h:
             if rec.get("is_trial"):
-                patch_body["combined_fp"] = compute_combined_fp(hwid, client_ip, ls_token)
-                patch_body["bound_ip"] = client_ip
-            requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                           params={"license_key": f"eq.{key}"}, json=patch_body)
+                return jsonify({"valid": False, "error": "hwid_mismatch"})
+            print(f"[WARN] UA drift for {key}: {stored_ua} -> {ua_h}")
 
-        # Account limit check
+        patch = {}
+        if not rec.get("hwid"):    patch["hwid"] = hwid
+        if not rec.get("ua_hash"): patch["ua_hash"] = ua_h
+        if rec.get("is_trial"):
+            if not rec.get("combined_fp"):
+                patch["combined_fp"] = combined_fingerprint(hwid, client_ip, ls_token, ua_h, extra_fp)
+            if not rec.get("bound_ip"):
+                patch["bound_ip"] = client_ip
+        if patch:
+            requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                           params={"license_key": f"eq.{key}"}, json=patch)
+
         limit = rec.get("accounts_limit", 0)
         used  = rec.get("accounts_used", 0) or 0
         if limit < 9999 and used >= limit:
             return jsonify({"valid": False, "error": "limit_reached", "used": used, "limit": limit})
 
-        license_valid = True; current_key = key; license_record = rec
+        sess_token = create_session(key, rec, client_ip, ua_h)
+        final_ls   = ls_token or secrets.token_hex(16)
+
         return jsonify({
-            "valid": True,
-            "plan":  "Unlimited" if limit >= 9999 else f"{limit} accounts",
-            "used":  used, "limit": limit,
-            "accounts_left": None if limit >= 9999 else (limit - used),
-            "is_trial": rec.get("is_trial", False),
-            "ls_token": ls_token or secrets.token_hex(16),  # give client a token to persist
+            "valid":          True,
+            "session_token":  sess_token,
+            "plan":           "Unlimited" if limit >= 9999 else f"{limit} accounts",
+            "used":           used,
+            "limit":          limit,
+            "accounts_left":  None if limit >= 9999 else (limit - used),
+            "is_trial":       rec.get("is_trial", False),
+            "ls_token":       final_ls,
         })
     except Exception as e:
         print("VERIFY ERROR:", e)
@@ -543,57 +696,69 @@ def verify():
 
 @app.route("/claim-trial", methods=["POST"])
 def claim_trial():
+    client_ip = get_client_ip()
+    if not rate_limit(f"trial:{client_ip}", RL_TRIAL_MAX, RL_TRIAL_WIN):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
     try:
         body = request.json or {}
         client_hwid = body.get("hwid", "").strip()
         ls_token    = body.get("ls_token", "").strip()
-        client_ip   = get_client_ip()
-        hwid = client_hwid if client_hwid else get_hwid(client_ip)
+        extra_fp    = body.get("fp", "").strip()
+        ua          = get_client_ua()
+        ua_h        = ua_hash(ua)
+        hwid        = client_hwid or hashlib.sha256(client_ip.encode()).hexdigest()
 
-        # STRICT CHECK 1: HWID already used for trial?
+        if is_datacenter_ip(client_ip):
+            return jsonify({"ok": False, "error": "blocked", "reason": "datacenter_ip"})
+
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
                          params={"hwid": f"eq.{hwid}", "is_trial": "eq.true",
                                  "select": "id,license_key"})
         if r.status_code == 200 and r.json():
-            existing = r.json()[0]
             return jsonify({"ok": False, "error": "already_claimed",
-                            "key": existing["license_key"], "reason": "hwid"})
+                            "reason": "hwid", "key": r.json()[0]["license_key"]})
 
-        # STRICT CHECK 2: IP already claimed a trial in last 30 days?
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         r2 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
                           params={"bound_ip": f"eq.{client_ip}", "is_trial": "eq.true",
-                                  "created_at": f"gte.{cutoff}",
-                                  "select": "id,license_key"})
+                                  "created_at": f"gte.{cutoff}", "select": "id"})
         if r2.status_code == 200 and r2.json():
             return jsonify({"ok": False, "error": "already_claimed", "reason": "ip"})
 
-        # STRICT CHECK 3: localStorage token already bound to a trial?
+        subnet_16 = ip_subnet(client_ip, 2)
+        cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        r2b = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                           params={"bound_ip": f"like.{subnet_16}.*", "is_trial": "eq.true",
+                                   "created_at": f"gte.{cutoff_7d}", "select": "id"})
+        if r2b.status_code == 200 and len(r2b.json()) >= 3:
+            return jsonify({"ok": False, "error": "blocked", "reason": "subnet_abuse"})
+
         if ls_token:
             r3 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
                               params={"ls_token": f"eq.{ls_token}", "is_trial": "eq.true",
-                                      "select": "id,license_key"})
+                                      "select": "id"})
             if r3.status_code == 200 and r3.json():
                 return jsonify({"ok": False, "error": "already_claimed", "reason": "token"})
 
-        # STRICT CHECK 4: combined fingerprint match?
-        combined_fp = compute_combined_fp(hwid, client_ip, ls_token)
+        combined_fp = combined_fingerprint(hwid, client_ip, ls_token, ua_h, extra_fp)
         r4 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
                           params={"combined_fp": f"eq.{combined_fp}", "is_trial": "eq.true",
-                                  "select": "id,license_key"})
+                                  "select": "id"})
         if r4.status_code == 200 and r4.json():
             return jsonify({"ok": False, "error": "already_claimed", "reason": "fingerprint"})
 
-        # All checks passed — issue new trial
+        r5 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                          params={"ua_hash": f"eq.{ua_h}", "bound_ip": f"eq.{client_ip}",
+                                  "is_trial": "eq.true", "select": "id"})
+        if r5.status_code == 200 and r5.json():
+            return jsonify({"ok": False, "error": "already_claimed", "reason": "ua+ip"})
+
         def seg(): return "".join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
         key = f"TRIAL-{seg()}-{seg()}-{seg()}"
-
         expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        final_ls = ls_token or secrets.token_hex(16)
 
-        # Generate a new ls_token if client didn't send one
-        final_ls_token = ls_token or secrets.token_hex(16)
-
-        body_insert = {
+        insert_body = {
             "license_key":    key,
             "accounts_limit": 1,
             "accounts_used":  0,
@@ -602,113 +767,151 @@ def claim_trial():
             "is_trial":       True,
             "hwid":           hwid,
             "bound_ip":       client_ip,
-            "ls_token":       final_ls_token,
+            "ls_token":       final_ls,
             "combined_fp":    combined_fp,
+            "ua_hash":        ua_h,
             "note":           "free trial",
         }
-        r5 = requests.post(f"{SUPABASE_URL}/rest/v1/licenses",
+        r6 = requests.post(f"{SUPABASE_URL}/rest/v1/licenses",
                            headers={**supa_hdrs(), "Prefer": "return=representation"},
-                           json=body_insert)
-        if r5.status_code not in (200, 201):
+                           json=insert_body)
+        if r6.status_code not in (200, 201):
             return jsonify({"ok": False, "error": "db_error"})
 
-        return jsonify({"ok": True, "key": key, "ls_token": final_ls_token})
+        return jsonify({"ok": True, "key": key, "ls_token": final_ls})
     except Exception as e:
         print("TRIAL ERROR:", e)
         return jsonify({"ok": False, "error": "server_error"})
 
 @app.route("/set-proxies", methods=["POST"])
 def set_proxies():
-    global proxies_list
-    if not license_valid: return jsonify({"ok": False, "error": "not_authenticated"})
+    sess = require_http_session()
+    if not sess: return jsonify({"ok": False, "error": "not_authenticated"}), 401
     try:
         lines = (request.json or {}).get("proxies","").strip().splitlines()
         valid = [l.strip() for l in lines if l.strip() and not l.startswith("#") and parse_proxy(l.strip())]
-        PROXIES_FILE.write_text("\n".join(valid))
-        proxies_list = valid
+        save_user_proxies(sess["license_key"], valid)
+        sess["proxies"] = valid
         return jsonify({"ok": True, "count": len(valid)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/set-webhook", methods=["POST"])
 def set_webhook():
-    global active_webhook
-    if not license_valid: return jsonify({"ok": False, "error": "not_authenticated"})
+    sess = require_http_session()
+    if not sess: return jsonify({"ok": False, "error": "not_authenticated"}), 401
     try:
         wh = (request.json or {}).get("webhook","").strip()
         if wh and not wh.startswith("https://discord.com/api/webhooks/"):
             return jsonify({"ok": False, "error": "invalid_webhook"})
-
-        # Test webhook before saving
-        if wh:
-            if not test_webhook(wh):
-                return jsonify({"ok": False, "error": "webhook_unreachable"})
-
-        active_webhook = wh
-        WEBHOOK_FILE.write_text(wh)
+        if wh and not test_webhook(wh):
+            return jsonify({"ok": False, "error": "webhook_unreachable"})
+        sess["webhook"] = wh
+        save_user_webhook(sess["license_key"], wh)
         return jsonify({"ok": True, "tested": bool(wh)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/get-proxies", methods=["GET"])
 def get_proxies():
-    if not license_valid: return jsonify({"ok": False})
-    return jsonify({"ok": True, "count": len(proxies_list)})
+    sess = require_http_session()
+    if not sess: return jsonify({"ok": False}), 401
+    return jsonify({"ok": True, "count": len(sess["proxies"])})
 
 @app.route("/get-webhook", methods=["GET"])
 def get_webhook():
-    if not license_valid: return jsonify({"ok": False})
-    return jsonify({"ok": True, "has_webhook": bool(active_webhook)})
+    sess = require_http_session()
+    if not sess: return jsonify({"ok": False}), 401
+    return jsonify({"ok": True, "has_webhook": bool(sess["webhook"])})
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    body = request.json or {}
+    token = body.get("session_token", "").strip()
+    if token: destroy_session(token)
+    return jsonify({"ok": True})
 
 # ── SocketIO ──────────────────────────────────────────────────────────────────
+@socketio.on("connect")
+def on_connect(auth):
+    token = (auth or {}).get("token", "") if isinstance(auth, dict) else ""
+    sess  = get_session_by_token(token)
+    if not sess:
+        emit("auth_failed")
+        return False
+    sid_to_token[request.sid] = token
+    emit("authed", {"ok": True})
+
+@socketio.on("disconnect")
+def on_disconnect():
+    sid_to_token.pop(request.sid, None)
+
 @socketio.on("get_info")
 def on_info():
-    emit("info", {"proxies": len(proxies_list), "webhook": bool(active_webhook)})
+    sess = socket_session()
+    if not sess: return
+    emit("info", {"proxies": len(sess["proxies"]), "webhook": bool(sess["webhook"])})
 
 @socketio.on("start")
 def on_start(data):
-    global license_record
-    if not license_valid or state["running"]: return
+    sess = socket_session()
+    if not sess:
+        emit("auth_failed"); return
+    if sess["state"]["running"]: return
 
-    # BLOCK START IF NO WEBHOOK
-    if not active_webhook:
+    if not sess["webhook"]:
         emit("start_blocked", {"reason": "webhook_required",
                                "message": "Set a Discord webhook first. Accounts cannot be delivered without it."})
-        log_emit("⚠ Cannot start — webhook required. Set a Discord webhook first.", "err")
+        log_emit(sid_to_token[request.sid], "Cannot start - webhook required.", "err")
         return
 
-    # Refresh record
-    if current_key:
-        fresh = fetch_license(current_key)
-        if fresh: license_record = fresh
+    fresh = fetch_license(sess["license_key"])
+    if not fresh or fresh.get("status") != "active":
+        emit("limit_reached", {"used": 0, "limit": 0, "reason": "revoked"}); return
 
-    limit = license_record.get("accounts_limit", 0) if license_record else 0
-    used  = (license_record.get("accounts_used") or 0) if license_record else 0
+    exp = fresh.get("expiry_date")
+    if exp:
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z","+00:00"))
+            if exp_dt.tzinfo is None: exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            if exp_dt < datetime.now(timezone.utc):
+                emit("limit_reached", {"used": 0, "limit": 0, "reason": "expired"}); return
+        except: pass
+
+    sess["license_record"] = fresh
+    limit = fresh.get("accounts_limit", 0)
+    used  = fresh.get("accounts_used", 0) or 0
     if limit < 9999 and used >= limit:
         emit("limit_reached", {"used": used, "limit": limit}); return
 
     count      = int(data.get("count", 10))
     concurrent = int(data.get("concurrent", 10))
+    concurrent = max(1, min(concurrent, 50))
 
-    # Cap to remaining
-    if license_record and limit < 9999:
+    if limit < 9999:
         remaining = limit - used
         if count > remaining:
             count = remaining
-            log_emit(f"Count capped to {remaining} (remaining allowance)", "inf")
+            log_emit(sid_to_token[request.sid], f"Count capped to {remaining} (remaining allowance)", "inf")
 
-    if count <= 0: emit("limit_reached", {"used": used, "limit": limit}); return
+    if count <= 0:
+        emit("limit_reached", {"used": used, "limit": limit}); return
 
-    state.update(running=True, stop=False, created=0, active=0, failed=0, target=count)
+    sess["state"] = fresh_state()
+    sess["state"].update(running=True, target=count, last_license_check=time.time())
     emit("started", {"count": count})
-    log_emit(f"Starting {count} accounts ({concurrent} concurrent)...", "inf")
-    threading.Thread(target=run_generator, args=(count, concurrent), daemon=True).start()
+    log_emit(sid_to_token[request.sid], f"Starting {count} accounts ({concurrent} concurrent)...", "inf")
+
+    token = sid_to_token[request.sid]
+    threading.Thread(target=run_generator, args=(token, count, concurrent), daemon=True).start()
 
 @socketio.on("stop")
 def on_stop():
-    state["stop"] = True
+    sess = socket_session()
+    if not sess: return
+    sess["state"]["stop"] = True
     emit("stopped")
-    log_emit("Stopping...", "inf")
+    log_emit(sid_to_token[request.sid], "Stopping...", "inf")
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -734,7 +937,6 @@ HTML = r"""<!DOCTYPE html>
   html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); }
   ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
 
-  /* ── LICENSE SCREEN ── */
   .lic-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; background: radial-gradient(ellipse 60% 40% at 50% 0%, rgba(0,212,255,0.06) 0%, transparent 70%), var(--bg); }
   .lic-card { width: 100%; max-width: 480px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 36px 28px 28px; position: relative; overflow: hidden; }
   .lic-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--cyan), transparent); }
@@ -779,9 +981,7 @@ HTML = r"""<!DOCTYPE html>
   .lic-dot { width: 6px; height: 6px; background: var(--muted2); border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; transition: background .3s; }
   .lic-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse-dot 1.4s infinite; }
 
-  /* ── MAIN APP ── */
   .app { min-height: 100vh; max-width: 580px; margin: 0 auto; padding: 20px 16px 40px; display: flex; flex-direction: column; gap: 12px; }
-
   .hdr { display: flex; align-items: center; gap: 12px; padding: 16px 0 12px; border-bottom: 1px solid var(--border); }
   .hdr-logo { font-family: var(--sans); font-size: 22px; font-weight: 800; color: var(--cyan); letter-spacing: 4px; }
   .hdr-sub { font-size: 10px; color: var(--muted); letter-spacing: 2px; }
@@ -815,7 +1015,6 @@ HTML = r"""<!DOCTYPE html>
   .config-card-hdr { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 2px; color: var(--muted); cursor: pointer; user-select: none; transition: background .15s; }
   .config-card-hdr:hover { background: var(--surface2); }
   .config-card-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
-
   .config-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   .config-field { display: flex; align-items: center; gap: 10px; }
   .config-label { font-size: 10px; letter-spacing: 2px; color: var(--muted); white-space: nowrap; }
@@ -827,7 +1026,6 @@ HTML = r"""<!DOCTYPE html>
   .panel-label:hover { color: var(--text); }
   .panel-label .badge { font-size: 9px; color: var(--muted2); }
   .panel-label .badge.ok { color: var(--green); }
-  .panel-label .badge.req { color: var(--red); }
   .panel-inner { display: none; }
   .panel-inner.open { display: block; }
   .panel-textarea { width: 100%; min-height: 80px; padding: 10px 12px; resize: vertical; background: transparent; border: none; outline: none; color: var(--cyan); font-family: var(--mono); font-size: 11px; line-height: 1.7; }
@@ -837,7 +1035,6 @@ HTML = r"""<!DOCTYPE html>
   .panel-btn:hover { background: var(--cyan); color: var(--bg); }
   .panel-status { font-size: 10px; color: var(--muted); letter-spacing: 1px; margin-left: auto; transition: color .2s; }
 
-  /* webhook required wrapper */
   .webhook-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; transition: border-color .3s; }
   .webhook-wrap.required { border-color: rgba(255,59,92,.5); box-shadow: 0 0 0 1px rgba(255,59,92,.2); }
   .webhook-row { display: flex; align-items: center; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border); }
@@ -863,9 +1060,7 @@ HTML = r"""<!DOCTYPE html>
   .run-btn.stop { background: transparent; border: 1px solid var(--red); color: var(--red); }
   .run-btn.stop:hover { background: rgba(255,59,92,.08); }
   .run-btn.disabled-btn { opacity: .4; pointer-events: none; border: 1px solid var(--muted); color: var(--muted); background: transparent; }
-  .run-btn:active { transform: scale(.99); }
 
-  /* warning banner (webhook required, etc) */
   .warn-banner { background: rgba(245,200,66,.08); border: 1px solid rgba(245,200,66,.35); border-radius: var(--radius); padding: 12px 16px; font-size: 11px; color: var(--gold); letter-spacing: .3px; display: none; align-items: flex-start; gap: 10px; line-height: 1.5; }
   .warn-banner.show { display: flex; animation: fadeIn .2s ease; }
   .warn-banner .warn-icon { font-size: 14px; flex-shrink: 0; line-height: 1; margin-top: 1px; }
@@ -897,16 +1092,23 @@ HTML = r"""<!DOCTYPE html>
 <div id="app"></div>
 <script>
 let licenseInfo = null;
+let sessionToken = null;
+let socket = null;
+let running = false;
+let webhookSet = false;
+let cfgOpen = true;
+let tutOpen = false;
+
 const ERR_MAP = {
-  not_found:     'invalid license key — contact Kuni',
+  not_found:     'invalid license key - contact Kuni',
   disabled:      'this license has been disabled',
-  expired:       'license has expired — contact Kuni',
-  hwid_mismatch: 'this key is bound to another machine',
-  limit_reached: 'account limit reached — upgrade your plan',
-  server_error:  'server error — try again later',
+  expired:       'license has expired - contact Kuni',
+  hwid_mismatch: 'this key is bound to another machine/browser',
+  limit_reached: 'account limit reached - upgrade your plan',
+  rate_limited:  'too many attempts - wait 1 minute',
+  server_error:  'server error - try again later',
 };
 
-// ── LOCAL STORAGE TOKEN (for trial binding) ──────────────────────────────────
 function getLsToken() {
   let t = localStorage.getItem('_kuni_lst');
   if (!t) {
@@ -916,35 +1118,83 @@ function getLsToken() {
   return t;
 }
 
-// ── DEVICE FINGERPRINT ───────────────────────────────────────────────────────
+async function getCanvasFp() {
+  try {
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+    ctx.fillStyle = '#f60'; ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = '#069'; ctx.fillText('kuni-fp', 2, 15);
+    ctx.fillStyle = 'rgba(102,204,0,0.7)'; ctx.fillText('kuni-fp', 4, 17);
+    return c.toDataURL().slice(-64);
+  } catch { return ''; }
+}
+
+async function getAudioFp() {
+  try {
+    const AC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!AC) return '';
+    const ctx = new AC(1, 5000, 44100);
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle'; osc.frequency.value = 10000;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12;
+    comp.attack.value = 0; comp.release.value = 0.25;
+    osc.connect(comp); comp.connect(ctx.destination);
+    osc.start(0);
+    const buf = await ctx.startRendering();
+    const ch = buf.getChannelData(0);
+    let sum = 0; for (let i = 4500; i < 5000; i++) sum += Math.abs(ch[i]);
+    return sum.toString(36).slice(-20);
+  } catch { return ''; }
+}
+
+function getWebGLFp() {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) return '';
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : (gl.getParameter(gl.RENDERER) || '');
+    const vendor   = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)   : (gl.getParameter(gl.VENDOR)   || '');
+    return (renderer + '|' + vendor).slice(0, 100);
+  } catch { return ''; }
+}
+
+function getFontFp() {
+  try {
+    const fonts = ['Arial','Courier New','Georgia','Times New Roman','Verdana','Trebuchet MS','Comic Sans MS','Impact','Tahoma'];
+    const test = document.createElement('span');
+    test.style.position='absolute'; test.style.visibility='hidden';
+    test.style.fontSize='72px'; test.textContent='mmmmmmmmmmlli';
+    document.body.appendChild(test);
+    const baseline = {};
+    ['monospace','serif','sans-serif'].forEach(base => { test.style.fontFamily=base; baseline[base]={w:test.offsetWidth,h:test.offsetHeight}; });
+    const detected = fonts.filter(f => {
+      return ['monospace','serif','sans-serif'].some(base => {
+        test.style.fontFamily = `'${f}',${base}`;
+        return test.offsetWidth !== baseline[base].w || test.offsetHeight !== baseline[base].h;
+      });
+    });
+    document.body.removeChild(test);
+    return detected.join(',');
+  } catch { return ''; }
+}
+
+async function sha256Hex(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
 async function getDeviceFingerprint() {
   try {
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    ctx.textBaseline = 'top';
-    ctx.font = '14px Arial';
-    ctx.fillStyle = '#f60';
-    ctx.fillRect(125, 1, 62, 20);
-    ctx.fillStyle = '#069';
-    ctx.fillText('kuni-fp', 2, 15);
-    ctx.fillStyle = 'rgba(102,204,0,0.7)';
-    ctx.fillText('kuni-fp', 4, 17);
-    const canvasData = canvas.toDataURL();
-
     const raw = [
-      navigator.userAgent,
-      navigator.language,
-      screen.width + 'x' + screen.height,
-      screen.colorDepth,
-      new Date().getTimezoneOffset(),
-      navigator.hardwareConcurrency || 0,
-      navigator.platform,
-      navigator.maxTouchPoints || 0,
-      canvasData.slice(-64),
+      navigator.userAgent, navigator.language, screen.width+'x'+screen.height,
+      screen.colorDepth, new Date().getTimezoneOffset(),
+      navigator.hardwareConcurrency||0, navigator.platform, navigator.maxTouchPoints||0,
+      await getCanvasFp(),
     ].join('|');
-
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
-    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+    return await sha256Hex(raw);
   } catch {
     let id = localStorage.getItem('_did');
     if (!id) { id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); localStorage.setItem('_did', id); }
@@ -952,77 +1202,100 @@ async function getDeviceFingerprint() {
   }
 }
 
-// ── TRIAL ────────────────────────────────────────────────────────────────────
+async function getExtraFp() {
+  const audio = await getAudioFp();
+  const webgl = getWebGLFp();
+  const fonts = getFontFp();
+  return await sha256Hex(audio + '|' + webgl + '|' + fonts);
+}
+
+async function authFetch(url, opts) {
+  opts = opts || {};
+  const headers = Object.assign({'Content-Type': 'application/json'}, opts.headers || {});
+  if (sessionToken) headers['X-Session-Token'] = sessionToken;
+  return fetch(url, Object.assign({}, opts, {headers}));
+}
+
 async function claimTrial() {
   const btn = document.getElementById('trialBtn');
   const err = document.getElementById('licErr');
   btn.classList.add('loading'); btn.textContent = 'Claiming...';
   err.textContent = ''; err.style.color = 'var(--muted)';
   try {
-    const hwid = await getDeviceFingerprint();
+    const [hwid, fp] = await Promise.all([getDeviceFingerprint(), getExtraFp()]);
     const ls_token = getLsToken();
-    const r = await fetch('/claim-trial', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hwid, ls_token})});
+    const r = await fetch('/claim-trial',{method:'POST',headers:{'Content-Type':'application/json'},
+                                          body:JSON.stringify({hwid, ls_token, fp})});
     const d = await r.json();
     if (d.ok) {
       if (d.ls_token) localStorage.setItem('_kuni_lst', d.ls_token);
-      err.style.color = 'var(--green)'; err.textContent = 'trial key claimed! verifying...';
-      const input = document.getElementById('licInput');
-      if (input) { input.value = d.key; }
+      err.style.color='var(--green)'; err.textContent='trial key claimed! verifying...';
+      document.getElementById('licInput').value = d.key;
       setTimeout(async () => {
         const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},
-                                              body:JSON.stringify({key:d.key, hwid, ls_token: getLsToken()})});
+                                              body:JSON.stringify({key:d.key, hwid, ls_token:getLsToken(), fp})});
         const vd = await vr.json();
         if (vd.valid) {
+          sessionToken = vd.session_token;
           localStorage.setItem('license', d.key);
+          localStorage.setItem('session_token', sessionToken);
           licenseInfo = vd;
           showMainApp();
         } else {
-          err.style.color='var(--red)';
-          err.textContent = ERR_MAP[vd.error] || 'verify failed';
-          btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
+          err.style.color='var(--red)'; err.textContent = ERR_MAP[vd.error]||'verify failed';
+          btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
         }
       }, 800);
     } else if (d.error === 'already_claimed') {
-      err.style.color = 'var(--gold)';
-      const reason = d.reason === 'ip' ? 'this IP address' :
-                     d.reason === 'token' ? 'this browser' :
-                     d.reason === 'fingerprint' ? 'this device signature' :
-                     'this device';
-      err.textContent = `${reason} already has a trial`;
-      if (d.key && document.getElementById('licInput')) document.getElementById('licInput').value = d.key;
-      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
+      err.style.color='var(--gold)';
+      const why = d.reason==='ip'?'this IP address':
+                  d.reason==='token'?'this browser':
+                  d.reason==='fingerprint'?'this device signature':
+                  d.reason==='ua+ip'?'this browser + IP':
+                  'this device';
+      err.textContent = why + ' already has a trial';
+      if (d.key) document.getElementById('licInput').value = d.key;
+      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
+    } else if (d.error === 'blocked') {
+      err.style.color='var(--red)';
+      err.textContent = d.reason==='datacenter_ip'?'VPN/datacenter IPs are not allowed for trials':
+                        d.reason==='subnet_abuse'?'too many trials from this network':
+                        'trial not available';
+      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
+    } else if (d.error === 'rate_limited') {
+      err.style.color='var(--red)'; err.textContent='too many attempts - wait 1 hour';
+      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
     } else {
-      err.style.color = 'var(--red)'; err.textContent = 'failed to claim trial — try again';
-      btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
+      err.style.color='var(--red)'; err.textContent='failed to claim trial';
+      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
     }
   } catch {
-    err.style.color = 'var(--red)'; err.textContent = 'server error — try again';
-    btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
+    err.style.color='var(--red)'; err.textContent='server error';
+    btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
   }
 }
 
-// ── LICENSE SCREEN ───────────────────────────────────────────────────────────
 function showLicenseScreen() {
   document.getElementById('app').innerHTML = `
     <div class="lic-wrap animate-in">
       <div class="lic-card">
         <div class="lic-logo">KUNI</div>
-        <div class="lic-sub">Auto SB Gen &nbsp;·&nbsp; v2.5</div>
+        <div class="lic-sub">Auto SB Gen &nbsp;&middot;&nbsp; v2.6</div>
         <span class="lic-label">LICENSE KEY</span>
         <input class="lic-input" id="licInput" type="text" placeholder="KUNI-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
         <button class="lic-btn" id="licBtn" onclick="doLogin()">Verify License</button>
         <div class="lic-err" id="licErr"></div>
 
         <div class="trial-divider"><span>OR</span></div>
-        <button class="trial-btn" id="trialBtn" onclick="claimTrial()">🎁 Get Free Trial — 1 account</button>
-        <div class="trial-note">1 free trial per device · HWID + IP + browser locked</div>
+        <button class="trial-btn" id="trialBtn" onclick="claimTrial()">Get Free Trial - 1 account</button>
+        <div class="trial-note">1 free trial per device &middot; HWID + IP + browser + fingerprint locked</div>
 
         <div class="price-section">
           <div class="price-title">PRICING</div>
           <div class="price-grid">
-            <div class="price-card"><div class="price-name">BASIC</div><div class="price-limit">100 accounts</div><div class="price-amt">$59.99</div><div class="price-php">≈ ₱3,389</div><div class="price-dur">30 days</div></div>
-            <div class="price-card featured"><div class="price-name">PRO</div><div class="price-limit">500 accounts</div><div class="price-amt">$249.99</div><div class="price-php">≈ ₱14,124</div><div class="price-dur">30 days</div></div>
-            <div class="price-card"><div class="price-name">UNLIMITED</div><div class="price-limit">no limit</div><div class="price-amt">$399.99</div><div class="price-php">≈ ₱22,599</div><div class="price-dur">60 days</div></div>
+            <div class="price-card"><div class="price-name">BASIC</div><div class="price-limit">100 accounts</div><div class="price-amt">$59.99</div><div class="price-php">&asymp; &#8369;3,389</div><div class="price-dur">30 days</div></div>
+            <div class="price-card featured"><div class="price-name">PRO</div><div class="price-limit">500 accounts</div><div class="price-amt">$249.99</div><div class="price-php">&asymp; &#8369;14,124</div><div class="price-dur">30 days</div></div>
+            <div class="price-card"><div class="price-name">UNLIMITED</div><div class="price-limit">no limit</div><div class="price-amt">$399.99</div><div class="price-php">&asymp; &#8369;22,599</div><div class="price-dur">60 days</div></div>
           </div>
           <div class="discord-section">
             <div class="discord-label">join our server to purchase</div>
@@ -1033,10 +1306,7 @@ function showLicenseScreen() {
           </div>
         </div>
 
-        <div class="lic-footer">
-          <span><span class="lic-dot" id="connDot"></span>kuni tool</span>
-          <span>v2.5</span>
-        </div>
+        <div class="lic-footer"><span><span class="lic-dot" id="connDot"></span>kuni tool</span><span>v2.6</span></div>
       </div>
     </div>`;
   document.getElementById('licInput').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
@@ -1049,36 +1319,36 @@ async function doLogin() {
   const dot = document.getElementById('connDot');
   if (!key) { err.style.color='#f5c842'; err.textContent='please enter a license key'; return; }
   btn.classList.add('loading'); btn.textContent = 'Verifying...';
-  err.style.color='#4a6070'; err.textContent='connecting to license server...';
+  err.style.color='#4a6070'; err.textContent='connecting...';
   dot && dot.classList.add('active');
   try {
-    const hwid = await getDeviceFingerprint();
+    const [hwid, fp] = await Promise.all([getDeviceFingerprint(), getExtraFp()]);
     const ls_token = getLsToken();
-    const res  = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key, hwid, ls_token})});
+    const res = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},
+                                           body:JSON.stringify({key, hwid, ls_token, fp})});
     const data = await res.json();
     if (data.valid) {
+      sessionToken = data.session_token;
       localStorage.setItem('license', key);
+      localStorage.setItem('session_token', sessionToken);
       if (data.ls_token) localStorage.setItem('_kuni_lst', data.ls_token);
       licenseInfo = data;
-      err.style.color='#00e87a'; err.textContent='license valid — loading...';
+      err.style.color='#00e87a'; err.textContent='license valid - loading...';
       setTimeout(showMainApp, 600);
     } else {
       btn.classList.remove('loading'); btn.textContent='Verify License';
-      err.style.color='#ff3b5c'; err.textContent=ERR_MAP[data.error]||'invalid license — contact Kuni';
+      err.style.color='#ff3b5c'; err.textContent = ERR_MAP[data.error] || 'invalid license - contact Kuni';
       dot && dot.classList.remove('active');
     }
   } catch {
     btn.classList.remove('loading'); btn.textContent='Verify License';
-    err.style.color='#ff3b5c'; err.textContent='server error — try again';
+    err.style.color='#ff3b5c'; err.textContent='server error';
     dot && dot.classList.remove('active');
   }
 }
 
-// ── MAIN APP ─────────────────────────────────────────────────────────────────
-let webhookSet = false;
-
 function showMainApp() {
-  const planLabel = licenseInfo ? licenseInfo.plan : '—';
+  const planLabel = licenseInfo ? licenseInfo.plan : '-';
   const isUnlimited = licenseInfo && licenseInfo.limit >= 9999;
 
   document.getElementById('app').innerHTML = `
@@ -1087,21 +1357,18 @@ function showMainApp() {
         <div><div class="hdr-logo">KUNI</div><div class="hdr-sub">AUTO SB GEN</div></div>
         <div class="hdr-right">
           <span class="plan-badge" id="planBadge">${planLabel}</span>${licenseInfo && licenseInfo.is_trial ? '<span class="trial-badge">TRIAL</span>' : ''}
-          <div class="hdr-ver">v2.5</div>
+          <div class="hdr-ver">v2.6</div>
         </div>
       </div>
 
       <div class="status-bar idle" id="statusBar">
         <span class="dot"></span>
-        <span class="status-text" id="statusText">idle — ready</span>
+        <span class="status-text" id="statusText">idle - ready</span>
       </div>
 
-      <!-- webhook required warning -->
       <div class="warn-banner" id="webhookWarn">
-        <span class="warn-icon">⚠</span>
-        <div>
-          <strong>Discord webhook required.</strong> Set your webhook below before running the generator — accounts cannot be delivered without it.
-        </div>
+        <span class="warn-icon">!</span>
+        <div><strong>Discord webhook required.</strong> Set your webhook below before running the generator.</div>
       </div>
 
       <div class="stats">
@@ -1113,17 +1380,14 @@ function showMainApp() {
 
       ${!isUnlimited ? `
       <div class="limit-bar-wrap">
-        <div class="limit-bar-top"><span>ACCOUNT USAGE</span><span id="limitText">—</span></div>
+        <div class="limit-bar-top"><span>ACCOUNT USAGE</span><span id="limitText">-</span></div>
         <div class="limit-bar-track"><div class="limit-bar-fill" id="limitBar" style="width:0%"></div></div>
       </div>` : ''}
 
-      <div class="limit-banner" id="limitBanner">⚠ Account limit reached — contact Kuni to upgrade your plan.</div>
+      <div class="limit-banner" id="limitBanner">Account limit reached - contact Kuni to upgrade your plan.</div>
 
       <div class="config-card">
-        <div class="config-card-hdr" onclick="toggleConfig()">
-          <span>CONFIG</span>
-          <span id="cfgToggle" style="font-size:9px;letter-spacing:2px">▲ HIDE</span>
-        </div>
+        <div class="config-card-hdr" onclick="toggleConfig()"><span>CONFIG</span><span id="cfgToggle" style="font-size:9px;letter-spacing:2px">HIDE</span></div>
         <div class="config-card-body" id="cfgBody">
           <div class="config-row">
             <div class="config-field"><span class="config-label">COUNT</span><input class="config-input" type="number" id="count" value="10" min="1" max="9999"></div>
@@ -1132,29 +1396,21 @@ function showMainApp() {
 
           <div class="panel-wrap">
             <div class="panel-label" onclick="togglePanel('proxyPanel')">
-              <span>PROXIES</span>
-              <span class="badge" id="proxyBadge">loading...</span>
+              <span>PROXIES</span><span class="badge" id="proxyBadge">loading...</span>
             </div>
             <div class="panel-inner" id="proxyPanel">
-              <textarea class="panel-textarea" id="proxyTA" placeholder="paste proxies here — clears after save for security&#10;host:port, host:port:user:pass, http://user:pass@host:port"></textarea>
-              <div class="panel-actions">
-                <button class="panel-btn" onclick="saveProxies()">SAVE</button>
-                <span class="panel-status" id="proxySt"></span>
-              </div>
+              <textarea class="panel-textarea" id="proxyTA" placeholder="paste proxies here - clears after save&#10;host:port, host:port:user:pass, http://user:pass@host:port"></textarea>
+              <div class="panel-actions"><button class="panel-btn" onclick="saveProxies()">SAVE</button><span class="panel-status" id="proxySt"></span></div>
             </div>
           </div>
 
-          <!-- webhook REQUIRED -->
           <div class="webhook-wrap" id="webhookWrap">
             <div class="webhook-row">
               <span class="webhook-lbl">WEBHOOK <span id="webhookReqMark" style="color:var(--red)">*</span></span>
               <input class="webhook-input" id="webhookInput" type="text" placeholder="https://discord.com/api/webhooks/...">
             </div>
-            <div class="webhook-req-note">Required — test ping sent on save to verify the URL works.</div>
-            <div class="panel-actions">
-              <button class="panel-btn" onclick="saveWebhook()">SAVE &amp; TEST</button>
-              <span class="panel-status" id="webhookSt"></span>
-            </div>
+            <div class="webhook-req-note">Required - test ping sent on save to verify the URL works.</div>
+            <div class="panel-actions"><button class="panel-btn" onclick="saveWebhook()">SAVE &amp; TEST</button><span class="panel-status" id="webhookSt"></span></div>
           </div>
         </div>
       </div>
@@ -1165,7 +1421,7 @@ function showMainApp() {
         <div class="tutorial-hdr" onclick="toggleTutorial()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
           <span style="letter-spacing:2px;font-size:10px">HOW TO USE YOUR ACCOUNTS</span>
-          <span id="tutToggle" style="margin-left:auto;font-size:9px;letter-spacing:2px;color:var(--muted)">▼ SHOW</span>
+          <span id="tutToggle" style="margin-left:auto;font-size:9px;letter-spacing:2px;color:var(--muted)">SHOW</span>
         </div>
         <div class="tutorial-body" id="tutBody">
           <div class="video-container">
@@ -1179,10 +1435,7 @@ function showMainApp() {
         <div class="log-box" id="logBox"></div>
       </div>
 
-      <div class="footer">
-        <span>kuni tool</span>
-        <a href="#" onclick="doLogout();return false;">logout</a>
-      </div>
+      <div class="footer"><span>kuni tool</span><a href="#" onclick="doLogout();return false;">logout</a></div>
     </div>`;
 
   loadSavedConfig();
@@ -1190,23 +1443,16 @@ function showMainApp() {
   initSocket();
 }
 
-let cfgOpen = true;
 function toggleConfig() {
   cfgOpen = !cfgOpen;
   document.getElementById('cfgBody').style.display = cfgOpen ? 'flex' : 'none';
-  document.getElementById('cfgToggle').textContent = cfgOpen ? '▲ HIDE' : '▼ SHOW';
+  document.getElementById('cfgToggle').textContent = cfgOpen ? 'HIDE' : 'SHOW';
 }
-
-function togglePanel(id) {
-  const p = document.getElementById(id);
-  p.classList.toggle('open');
-}
-
-let tutOpen = false;
+function togglePanel(id) { document.getElementById(id).classList.toggle('open'); }
 function toggleTutorial() {
   tutOpen = !tutOpen;
   document.getElementById('tutBody').classList.toggle('open', tutOpen);
-  document.getElementById('tutToggle').textContent = tutOpen ? '▲ HIDE' : '▼ SHOW';
+  document.getElementById('tutToggle').textContent = tutOpen ? 'HIDE' : 'SHOW';
 }
 
 function updateWebhookUI(hasWebhook) {
@@ -1215,41 +1461,29 @@ function updateWebhookUI(hasWebhook) {
   const warn = document.getElementById('webhookWarn');
   const mark = document.getElementById('webhookReqMark');
   if (!wrap || !warn) return;
-  if (hasWebhook) {
-    wrap.classList.remove('required');
-    warn.classList.remove('show');
-    if (mark) mark.style.display = 'none';
-  } else {
-    wrap.classList.add('required');
-    warn.classList.add('show');
-    if (mark) mark.style.display = 'inline';
-    // auto-open panel to draw attention
-    const proxy = document.getElementById('proxyPanel');
-    if (proxy) proxy.classList.remove('open');
-  }
+  if (hasWebhook) { wrap.classList.remove('required'); warn.classList.remove('show'); if (mark) mark.style.display='none'; }
+  else            { wrap.classList.add('required'); warn.classList.add('show'); if (mark) mark.style.display='inline'; }
 }
 
 async function loadSavedConfig() {
   try {
-    const r = await fetch('/get-proxies');
+    const r = await authFetch('/get-proxies');
     const d = await r.json();
     if (d.ok) {
       const badge = document.getElementById('proxyBadge');
-      badge.textContent = d.count > 0 ? d.count + ' loaded' : 'none';
-      badge.className = 'badge' + (d.count > 0 ? ' ok' : '');
+      badge.textContent = d.count > 0 ? d.count+' loaded' : 'none';
+      badge.className = 'badge'+(d.count>0?' ok':'');
     }
   } catch {}
   try {
-    const r = await fetch('/get-webhook');
+    const r = await authFetch('/get-webhook');
     const d = await r.json();
     if (d.ok) {
       updateWebhookUI(d.has_webhook);
-      if (d.has_webhook) {
-        const st = document.getElementById('webhookSt');
-        if (st) { st.style.color='var(--green)'; st.textContent='webhook set ✓'; }
-      } else {
-        const st = document.getElementById('webhookSt');
-        if (st) { st.style.color='var(--red)'; st.textContent='not set — REQUIRED'; }
+      const st = document.getElementById('webhookSt');
+      if (st) {
+        if (d.has_webhook) { st.style.color='var(--green)'; st.textContent='webhook set'; }
+        else               { st.style.color='var(--red)'; st.textContent='not set - REQUIRED'; }
       }
     }
   } catch {}
@@ -1260,14 +1494,14 @@ async function saveProxies() {
   const st = document.getElementById('proxySt');
   st.style.color='var(--muted)'; st.textContent='saving...';
   try {
-    const r = await fetch('/set-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxies:text})});
+    const r = await authFetch('/set-proxies',{method:'POST',body:JSON.stringify({proxies:text})});
     const d = await r.json();
     if (d.ok) {
-      st.style.color='var(--green)'; st.textContent=d.count+' proxies saved ✓';
-      document.getElementById('proxyTA').value = '';
-      const badge = document.getElementById('proxyBadge');
-      badge.textContent = d.count+' loaded'; badge.className='badge'+(d.count>0?' ok':'');
-      setTimeout(() => togglePanel('proxyPanel'), 800);
+      st.style.color='var(--green)'; st.textContent=d.count+' proxies saved';
+      document.getElementById('proxyTA').value='';
+      const b = document.getElementById('proxyBadge');
+      b.textContent=d.count+' loaded'; b.className='badge'+(d.count>0?' ok':'');
+      setTimeout(()=>togglePanel('proxyPanel'), 800);
     } else { st.style.color='var(--red)'; st.textContent=d.error||'error'; }
   } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
@@ -1275,45 +1509,43 @@ async function saveProxies() {
 async function saveWebhook() {
   const wh = document.getElementById('webhookInput').value.trim();
   const st = document.getElementById('webhookSt');
-  st.style.color='var(--muted)'; st.textContent = wh ? 'testing webhook...' : 'clearing...';
+  st.style.color='var(--muted)'; st.textContent = wh?'testing webhook...':'clearing...';
   try {
-    const r = await fetch('/set-webhook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webhook:wh})});
+    const r = await authFetch('/set-webhook',{method:'POST',body:JSON.stringify({webhook:wh})});
     const d = await r.json();
     if (d.ok) {
-      if (wh) {
-        st.style.color='var(--green)';
-        st.textContent = d.tested ? 'webhook verified ✓ — test message sent' : 'webhook saved ✓';
-        updateWebhookUI(true);
-      } else {
-        st.style.color='var(--gold)'; st.textContent='cleared';
-        updateWebhookUI(false);
-      }
+      if (wh) { st.style.color='var(--green)'; st.textContent = d.tested?'verified - test sent':'saved'; updateWebhookUI(true); }
+      else    { st.style.color='var(--gold)'; st.textContent='cleared'; updateWebhookUI(false); }
     } else {
       st.style.color='var(--red)';
-      st.textContent = d.error === 'invalid_webhook' ? 'invalid discord url' :
-                       d.error === 'webhook_unreachable' ? 'webhook test failed — check url' :
-                       (d.error || 'error');
+      st.textContent = d.error==='invalid_webhook'?'invalid discord url':
+                       d.error==='webhook_unreachable'?'test failed - check url':
+                       d.error==='not_authenticated'?'session expired - refresh':
+                       (d.error||'error');
     }
   } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
 
 function updateLimitBar() {
   if (!licenseInfo || licenseInfo.limit >= 9999) return;
-  const used  = licenseInfo.limit - (licenseInfo.accounts_left ?? 0);
+  const used = licenseInfo.limit - (licenseInfo.accounts_left || 0);
   const limit = licenseInfo.limit;
-  const pct   = Math.min(100, Math.round(used/limit*100));
-  const fill  = document.getElementById('limitBar');
+  const pct = Math.min(100, Math.round(used/limit*100));
+  const fill = document.getElementById('limitBar');
   if (fill) { fill.style.width=pct+'%'; fill.className='limit-bar-fill'+(pct>=90?' danger':pct>=70?' warn':''); }
   const txt = document.getElementById('limitText');
-  if (txt) txt.textContent=`${used} / ${limit} (${100-pct}% left)`;
+  if (txt) txt.textContent = used + ' / ' + limit + ' (' + (100-pct) + '% left)';
 }
 
-function showLimitReached(used, limit) {
+function showLimitReached(used, limit, reason) {
   const banner = document.getElementById('limitBanner');
-  if (banner) banner.classList.add('show');
+  if (banner) {
+    banner.classList.add('show');
+    banner.innerHTML = (reason==='revoked'?'License revoked':reason==='expired'?'License expired':'Account limit reached - contact Kuni to upgrade.');
+  }
   const btn = document.getElementById('mainBtn');
-  if (btn) { btn.className='run-btn disabled-btn'; btn.textContent='Limit Reached'; }
-  setStatus('limit', `limit reached — ${used}/${limit} used`);
+  if (btn) { btn.className='run-btn disabled-btn'; btn.textContent='Unavailable'; }
+  setStatus('limit', (reason||'limit reached') + ' - ' + used + '/' + limit);
 }
 
 function setStatus(mode, text) {
@@ -1323,48 +1555,55 @@ function setStatus(mode, text) {
 
 function clearLog() { const b=document.getElementById('logBox'); if(b) b.innerHTML=''; }
 
-function doLogout() { localStorage.removeItem('license'); location.reload(); }
+async function doLogout() {
+  try {
+    if (sessionToken) await fetch('/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_token:sessionToken})});
+  } catch {}
+  localStorage.removeItem('license');
+  localStorage.removeItem('session_token');
+  sessionToken = null;
+  location.reload();
+}
 
 function initSocket() {
-  const socket = io();
-  let running = false;
+  socket = io({ auth: { token: sessionToken } });
+
+  socket.on('auth_failed', () => {
+    localStorage.removeItem('license'); localStorage.removeItem('session_token');
+    sessionToken = null;
+    alert('Session expired - please log in again.');
+    location.reload();
+  });
 
   window.toggle = function() {
     if (running) { socket.emit('stop'); return; }
-
-    // client-side precheck — block if no webhook
     if (!webhookSet) {
-      setStatus('stopped', 'webhook required — set it first');
+      setStatus('stopped', 'webhook required - set it first');
       const warn = document.getElementById('webhookWarn');
-      if (warn) {
-        warn.classList.add('show');
-        warn.scrollIntoView({behavior:'smooth', block:'center'});
-      }
-      // open config + flash webhook field
+      if (warn) { warn.classList.add('show'); warn.scrollIntoView({behavior:'smooth', block:'center'}); }
       cfgOpen = true;
-      document.getElementById('cfgBody').style.display = 'flex';
-      document.getElementById('cfgToggle').textContent = '▲ HIDE';
+      document.getElementById('cfgBody').style.display='flex';
+      document.getElementById('cfgToggle').textContent='HIDE';
       const input = document.getElementById('webhookInput');
       if (input) input.focus();
       return;
     }
-
     const count=parseInt(document.getElementById('count').value)||10;
     const concurrent=parseInt(document.getElementById('concurrent').value)||10;
     socket.emit('start',{count,concurrent});
   };
 
   socket.on('started', d => {
-    running=true;
-    const btn=document.getElementById('mainBtn');
-    btn.className='run-btn stop'; btn.textContent='■  Stop';
-    setStatus('running','running — '+d.count+' accounts');
+    running = true;
+    const btn = document.getElementById('mainBtn');
+    btn.className='run-btn stop'; btn.textContent='Stop';
+    setStatus('running','running - '+d.count+' accounts');
   });
 
   socket.on('start_blocked', d => {
-    running=false;
-    setStatus('stopped', d.message || 'blocked');
-    if (d.reason === 'webhook_required') {
+    running = false;
+    setStatus('stopped', d.message||'blocked');
+    if (d.reason==='webhook_required') {
       updateWebhookUI(false);
       const warn = document.getElementById('webhookWarn');
       if (warn) warn.scrollIntoView({behavior:'smooth', block:'center'});
@@ -1372,17 +1611,17 @@ function initSocket() {
   });
 
   socket.on('stopped', () => {
-    running=false;
-    const btn=document.getElementById('mainBtn');
+    running = false;
+    const btn = document.getElementById('mainBtn');
     btn.className='run-btn idle'; btn.textContent='Run Generator';
     setStatus('stopped','stopped');
   });
 
   socket.on('done', d => {
-    running=false;
-    const btn=document.getElementById('mainBtn');
+    running = false;
+    const btn = document.getElementById('mainBtn');
     btn.className='run-btn idle'; btn.textContent='Run Generator';
-    setStatus('done','done — '+d.created+'/'+d.total+' created');
+    setStatus('done','done - '+d.created+'/'+d.total+' created');
   });
 
   socket.on('stats', d => {
@@ -1396,7 +1635,7 @@ function initSocket() {
       const fill = document.getElementById('limitBar');
       if (fill) { fill.style.width=pct+'%'; fill.className='limit-bar-fill'+(pct>=90?' danger':pct>=70?' warn':''); }
       const txt = document.getElementById('limitText');
-      if (txt) txt.textContent=`${used} / ${licenseInfo.limit} (${Math.max(0,100-pct)}% left)`;
+      if (txt) txt.textContent = used + ' / ' + licenseInfo.limit + ' (' + Math.max(0,100-pct) + '% left)';
     }
   });
 
@@ -1406,29 +1645,38 @@ function initSocket() {
     const line=document.createElement('div'); line.className='log-line '+(d.tag||'dim');
     const msg=d.msg||'';
     const m=msg.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*(.*)/s);
-    if (m) line.innerHTML=`<span class="log-ts">${m[1]}</span><span class="log-msg">${m[2]}</span>`;
-    else    line.innerHTML=`<span class="log-msg">${msg}</span>`;
+    if (m) line.innerHTML='<span class="log-ts">'+m[1]+'</span><span class="log-msg">'+m[2]+'</span>';
+    else   line.innerHTML='<span class="log-msg">'+msg+'</span>';
     box.appendChild(line); box.scrollTop=box.scrollHeight;
   });
 
   socket.on('limit_reached', d => {
-    running=false; showLimitReached(d.used, d.limit);
+    running = false;
+    showLimitReached(d.used||0, d.limit||0, d.reason);
   });
 }
 
-// ── Init ─────────────────────────────────────────────────────────────────────
 const savedKey = localStorage.getItem('license');
-if (savedKey) {
-  getDeviceFingerprint().then(hwid => {
+const savedToken = localStorage.getItem('session_token');
+if (savedKey && savedToken) {
+  (async () => {
+    const [hwid, fp] = await Promise.all([getDeviceFingerprint(), getExtraFp()]);
     const ls_token = getLsToken();
-    fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:savedKey, hwid, ls_token})})
-      .then(r=>r.json())
-      .then(data => {
-        if (data.valid) { licenseInfo=data; showMainApp(); }
-        else { localStorage.removeItem('license'); showLicenseScreen(); }
-      })
-      .catch(() => showLicenseScreen());
-  });
+    try {
+      const r = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},
+                                           body:JSON.stringify({key:savedKey, hwid, ls_token, fp})});
+      const d = await r.json();
+      if (d.valid) {
+        sessionToken = d.session_token;
+        localStorage.setItem('session_token', sessionToken);
+        licenseInfo = d;
+        showMainApp();
+      } else {
+        localStorage.removeItem('license'); localStorage.removeItem('session_token');
+        showLicenseScreen();
+      }
+    } catch { showLicenseScreen(); }
+  })();
 } else {
   showLicenseScreen();
 }
@@ -1443,5 +1691,5 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n[KUNI] v2.5 running on http://localhost:{port}\n")
-    socketio.run(app, host="0.0.0.0", port=port, debug=False)
+    print(f"\n[KUNI] v2.6 running on http://localhost:{port}\n")
+    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
