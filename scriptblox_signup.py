@@ -765,7 +765,7 @@ def create_account(sess_token, slot):
     account = {
         "username": username, "password": password,
         "email": email_addr,
-        "cookies_url": cookies_url, "has_session": bool(session_cookies),
+        "cookies_url": cookies_url, "has_cookies": bool(cookies_data),
         "verify_status": verify_status,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
