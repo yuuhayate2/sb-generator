@@ -13,6 +13,12 @@
 #   • SocketIO auth middleware (all events require valid session)
 #   • Subnet-level trial blocking (/16 + /24)
 #   • Live license re-check before every batch start
+#
+# FIX v2.6.1:
+#   • mw_poll_code: gumagamit na ng {"_token": csrf} sa JSON body (hindi X-CSRF-TOKEN header)
+#   • mw_create_email: kinukuha na ang email_token mula sa get_messages response
+#   • mw_poll_code: isinasama na ang email_token sa bawat poll request
+#   • Mas maayos na message parsing para sa mailwave response structure
 
 import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
@@ -268,8 +274,14 @@ def mw_setup():
         return None, None
 
 def mw_create_email(cookies, csrf):
-    """Create email alias on aula.edu.pl domain. Returns (email, new_csrf)."""
-    if not csrf or cookies is None: return None, csrf
+    """
+    Create email alias on aula.edu.pl domain.
+    Returns (email, new_csrf, email_token).
+
+    FIX v2.6.1: get_messages now sends {"_token": csrf} in JSON body
+    and extracts email_token from the response for use in polling.
+    """
+    if not csrf or cookies is None: return None, csrf, None
     for _ in range(20):
         alias = "kuni" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         try:
@@ -278,19 +290,32 @@ def mw_create_email(cookies, csrf):
                               cookies=cookies, proxies=NO_PROXY, timeout=15)
             cookies.update(dict(r.cookies))
             new_csrf = unquote(cookies.get("XSRF-TOKEN", csrf))
+
+            # FIX: send _token in JSON body (not X-CSRF-TOKEN header)
             r2 = requests.post(f"{MW_BASE}/get_messages",
-                               headers={"Content-Type": "application/json", "X-CSRF-TOKEN": new_csrf},
+                               json={"_token": new_csrf},
+                               headers={"Content-Type": "application/json"},
                                cookies=cookies, proxies=NO_PROXY, timeout=15)
-            mailbox = r2.json().get("mailbox", "")
+            data2 = r2.json() if r2.content else {}
+            mailbox = data2.get("mailbox", "")
+            email_token = data2.get("email_token", "")
+
             if MW_DOMAIN in mailbox:
-                print(f"[mw create] email={mailbox}")
-                return mailbox, new_csrf
+                print(f"[mw create] email={mailbox} email_token={'set' if email_token else 'MISSING'}")
+                return mailbox, new_csrf, email_token
         except Exception as e:
             print(f"[mw create] error: {e}")
-    return None, csrf
+    return None, csrf, None
 
-def mw_poll_code(cookies, csrf, timeout=120, poll_interval=3):
-    """Poll MailWave inbox for ScriptBlox verification code."""
+def mw_poll_code(cookies, csrf, email_token="", timeout=120, poll_interval=3):
+    """
+    Poll MailWave inbox for ScriptBlox verification code.
+
+    FIX v2.6.1:
+    - Request body now uses {"_token": csrf, "email_token": email_token}
+    - Correctly reads messages array from response
+    - Searches all string fields in each message for 7-digit code
+    """
     deadline = time.time() + timeout
     poll_count = 0
     time.sleep(3)  # initial wait
@@ -298,18 +323,25 @@ def mw_poll_code(cookies, csrf, timeout=120, poll_interval=3):
     while time.time() < deadline:
         poll_count += 1
         try:
+            # FIX: use _token in JSON body (confirmed from browser DevTools)
+            payload = {"_token": csrf}
+            if email_token:
+                payload["email_token"] = email_token
+
             r = requests.post(f"{MW_BASE}/get_messages",
-                              headers={"Content-Type": "application/json", "X-CSRF-TOKEN": csrf},
+                              json=payload,
+                              headers={"Content-Type": "application/json"},
                               cookies=cookies, proxies=NO_PROXY, timeout=15)
+
             data = r.json() if r.content else {}
-            # MailWave message keys vary — try all common ones
-            messages = (data.get("messages") or data.get("emails") or
-                        data.get("inbox") or data.get("mail") or [])
+
+            # mailwave response: {status, mailbox, email_token, messages:[...], histories:[...]}
+            messages = data.get("messages") or []
             if isinstance(messages, dict): messages = list(messages.values())
             if not isinstance(messages, list): messages = []
 
             if poll_count % 5 == 1:
-                print(f"[mw poll #{poll_count}] msg_count={len(messages)} keys={list(data.keys())[:5]}")
+                print(f"[mw poll #{poll_count}] msg_count={len(messages)} keys={list(data.keys())[:6]}")
                 if messages:
                     sample = messages[0]
                     if isinstance(sample, dict):
@@ -319,19 +351,21 @@ def mw_poll_code(cookies, csrf, timeout=120, poll_interval=3):
 
             for msg in messages:
                 if not isinstance(msg, dict): continue
-                # Flatten all string fields to search
+
+                # Flatten all string fields to search for code
                 parts = []
-                for k in ("from","sender","from_email","subject","body","body_html",
-                          "body_text","html","text","content","message","preview","snippet"):
+                for k in ("from", "sender", "from_email", "subject", "body", "body_html",
+                          "body_text", "html", "text", "content", "message", "preview",
+                          "snippet", "description"):
                     v = msg.get(k)
-                    if isinstance(v, str): parts.append(v)
+                    if isinstance(v, str):
+                        parts.append(v)
                     elif isinstance(v, dict):
                         for sub in v.values():
                             if isinstance(sub, str): parts.append(sub)
                 blob = " ".join(parts)
                 if not blob: continue
 
-                # SB detection — sender, subject, or body
                 blob_lower = blob.lower()
                 is_sb = ("scriptblox" in blob_lower or
                          "verification code" in blob_lower or
@@ -343,15 +377,17 @@ def mw_poll_code(cookies, csrf, timeout=120, poll_interval=3):
                     code = match.group(1)
                     print(f"[mw FOUND] code={code}")
                     return code
+
         except Exception as e:
             print(f"[mw poll] error: {e}")
         time.sleep(poll_interval)
+
     print(f"[mw] TIMEOUT after {poll_count} polls")
     return None
 
 # ── ScriptBlox verify + login ─────────────────────────────────────────────────
 def sb_verify_account(code, token_value, proxy_r=None):
-    """Submit vCode to SB. Returns (response, verified_bool)."""
+    """Submit vCode to SB. Returns (response, verified_bool, new_token)."""
     try:
         hdrs = sb_headers()
         hdrs["Referer"] = "https://scriptblox.com/verify"
@@ -362,7 +398,6 @@ def sb_verify_account(code, token_value, proxy_r=None):
                           cookies={"token": token_value},
                           proxies=proxy_r, timeout=25, verify=False)
         data = r.json() if r.content else {}
-        # SB returns message:false on success
         if r.status_code == 200 and data.get("message") is False:
             new_tok = data.get("token", "")
             if not new_tok:
@@ -639,7 +674,6 @@ def rand_password(): return "".join(random.choices(string.ascii_letters + string
 
 def proxy_to_requests(proxy):
     if not proxy: return None
-    # Handle string format (host:port or host:port:user:pass or http://...)
     if isinstance(proxy, str):
         p = proxy.strip()
         if p.startswith("http://") or p.startswith("https://"):
@@ -651,7 +685,6 @@ def proxy_to_requests(proxy):
             host, port, user, pw = parts
             return {"http": f"http://{user}:{pw}@{host}:{port}", "https": f"http://{user}:{pw}@{host}:{port}"}
         return {"http": f"http://{p}", "https": f"http://{p}"}
-    # Handle dict format from parse_proxy
     server = proxy.get("server", "")
     user, pw = proxy.get("username",""), proxy.get("password","")
     if user:
@@ -731,7 +764,9 @@ def create_account(sess_token, slot):
     # MailWave — CSRF-based, AULA domain
     mw_cookies, mw_csrf = mw_setup()
     captcha = solve_turnstile_capsolver()
-    email_addr, mw_csrf = mw_create_email(mw_cookies, mw_csrf)
+
+    # FIX: mw_create_email now returns 3 values including email_token
+    email_addr, mw_csrf, mw_email_token = mw_create_email(mw_cookies, mw_csrf)
 
     if not email_addr or not captcha:
         state["failed"] += 1
@@ -739,7 +774,7 @@ def create_account(sess_token, slot):
         log_emit(sess_token, f"[#{slot}] x setup failed ({reason})", "err")
         return
 
-    print(f"[#{slot}] email={email_addr}")
+    print(f"[#{slot}] email={email_addr} email_token={'set' if mw_email_token else 'missing'}")
 
     log_emit(sess_token, f"[#{slot}] submitting signup...", "dim")
 
@@ -751,11 +786,9 @@ def create_account(sess_token, slot):
             "terms": True, "captcha": captcha,
         }, headers=sb_headers(), proxies=proxy_r, timeout=30, verify=False)
         resp = r.json() if r.content else {}
-        # Debug: log response structure so we can see where token lives
         resp_keys = list(resp.keys()) if isinstance(resp, dict) else str(type(resp))
         resp_msg = str(resp.get("message",""))[:150] if isinstance(resp, dict) else ""
         print(f"[signup #{slot}] status={r.status_code} keys={resp_keys} msg={resp_msg} set-cookie={r.headers.get('set-cookie','')[:120]}")
-        # Try multiple locations for token
         signup_token = resp.get("token") or resp.get("accessToken") or ""
         if not signup_token and isinstance(resp.get("data"), dict):
             signup_token = resp["data"].get("token", "")
@@ -772,20 +805,17 @@ def create_account(sess_token, slot):
         log_emit(sess_token, f"[#{slot}] x signup failed ({r.status_code}): {err_msg}", "err")
         return
 
-    # Grab token from Set-Cookie header (raw)
     if not signup_token:
         sc = r.headers.get("set-cookie", "")
         m = re.search(r"token=([^;]+)", sc)
         if m: signup_token = m.group(1)
 
-    # Grab token from cookie jar
     if not signup_token:
         for c in r.cookies:
             if c.name == "token" and c.value:
                 signup_token = c.value
                 break
 
-    # FALLBACK: login to get token (SB may not return token on signup)
     if not signup_token:
         log_emit(sess_token, f"[#{slot}] no token in signup response - trying login...", "dim")
         login_tok, login_r = sb_login(email_addr, password, proxy_r)
@@ -797,16 +827,16 @@ def create_account(sess_token, slot):
             log_emit(sess_token, f"[#{slot}] x login also failed - no token", "err")
             return
 
-    # ── Navigate to verify page (mirrors browser flow) ────────────────────────
+    # Navigate to verify page
     try:
         requests.get("https://scriptblox.com/verify?redirect=/",
                      cookies={"token": signup_token}, headers=sb_headers(),
                      proxies=proxy_r, timeout=15, verify=False)
     except: pass
 
-    # ── Poll DisMail for verification code ────────────────────────────────────
+    # FIX: pass email_token to polling function
     log_emit(sess_token, f"[#{slot}] waiting for verification email...", "dim")
-    verify_code = mw_poll_code(mw_cookies, mw_csrf, timeout=120)
+    verify_code = mw_poll_code(mw_cookies, mw_csrf, email_token=mw_email_token, timeout=120)
     verified    = False
     final_token = signup_token
 
@@ -817,7 +847,6 @@ def create_account(sess_token, slot):
             verified = True
             final_token = new_tok
             log_emit(sess_token, f"[#{slot}] account verified!", "dim")
-            # Visit homepage like browser does after verify
             try:
                 requests.get(f"{SB_HOME}?showWelcome=true",
                              cookies={"token": final_token}, headers=sb_headers(),
@@ -830,7 +859,6 @@ def create_account(sess_token, slot):
 
     verify_status = "verified" if verified else "unverified"
 
-    # ── Fabricate full browser-like cookie set ─────────────────────────────────
     cookies_data = fabricate_full_cookies(final_token, username, verified=verified)
     cookies_json_str = json.dumps(cookies_data, indent=2)
     cookies_url = upload_cookies_to_sourcebin(cookies_json_str)
