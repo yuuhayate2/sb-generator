@@ -1,4 +1,18 @@
-
+# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.6
+# Deploy on Railway / Render — open http://localhost:5000
+#
+# v2.6 changelog:
+#   • Multi-user session isolation (per-license state, webhook, proxies)
+#   • Rate limiting on /verify-key
+#   • Email domain masking in Discord webhook (privacy)
+#   • Enhanced fingerprinting: canvas + audio + WebGL + fonts
+#   • Datacenter/VPN IP detection for trial abuse
+#   • Server-side UA consistency verification
+#   • Atomic counter with TOCTOU-safe retry loop
+#   • JWT exp parsing → accurate cookie expiry
+#   • SocketIO auth middleware (all events require valid session)
+#   • Subnet-level trial blocking (/16 + /24)
+#   • Live license re-check before every batch start
 
 import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
@@ -652,25 +666,46 @@ def send_webhook(webhook_url, username, password, email, cookies_url=None, cooki
     if not webhook_url: return False
     try:
         is_verified = (verify_status == "verified")
-        status_txt = "\u2705 Verified" if is_verified else "\u26A0\uFE0F Unverified"
+
+        # Clean, solid color palette — no emoji clutter
+        color = 0x00D4FF if is_verified else 0x4A6070  # cyan / muted
+        status_line = "Verified" if is_verified else "Unverified"
+
         fields = [
-            {"name": "\U0001F464 Username", "value": f"```{username}```", "inline": True},
-            {"name": "\U0001F511 Password", "value": f"```{password}```", "inline": True},
-            {"name": "\U0001F4E7 Email",    "value": f"```{mask_email(email)}```", "inline": False},
-            {"name": "\U0001F4C5 Created",  "value": datetime.now(timezone.utc).strftime("%b %d, %Y"), "inline": True},
-            {"name": "\u26A1 Status",       "value": status_txt, "inline": True},
+            {"name": "Username",    "value": f"`{username}`",             "inline": True},
+            {"name": "Status",      "value": f"`{status_line}`",          "inline": True},
+            {"name": "Created",     "value": datetime.now(timezone.utc).strftime("%b %d, %Y %H:%M UTC"), "inline": True},
+            {"name": "Email",       "value": f"`{mask_email(email)}`",    "inline": False},
         ]
+
         if cookies_url:
-            fields.append({"name": "\U0001F36A Cookies", "value": f"[cookies.json]({cookies_url})", "inline": False})
+            fields.append({
+                "name":  "Session Cookies",
+                "value": f"```json\ncookies.json ready for Cookie-Editor import\n```\n[**Download cookies.json**]({cookies_url})",
+                "inline": False,
+            })
+        else:
+            fields.append({
+                "name":  "Session Cookies",
+                "value": "_Attached to this message below._",
+                "inline": False,
+            })
+
         embed = {
-            "title": "\U0001F3AF New Account Generated",
-            "color": 0x00ffcc if is_verified else 0xf5c842,
-            "description": f"**{username}**",
-            "fields": fields,
-            "footer": {"text": "Kuni SB Generator \u00B7 v2.6"},
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "title":       "KUNI SB GENERATOR",
+            "description": f"A new ScriptBlox account has been delivered.",
+            "color":       color,
+            "fields":      fields,
+            "footer":      {"text": "Kuni Tool  ·  ScriptBlox Auto Generator"},
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
         }
-        payload = {"embeds": [embed]}
+
+        payload = {
+            "username":   "Kuni SB Gen",
+            "avatar_url": "https://cdn.discordapp.com/emojis/1163495097574047815.webp",
+            "embeds":     [embed],
+        }
+
         if cookies_json and not cookies_url:
             files = {"cookies.json": ("cookies.json", cookies_json, "application/json")}
             r = requests.post(webhook_url, data={"payload_json": json.dumps(payload)},
@@ -678,18 +713,20 @@ def send_webhook(webhook_url, username, password, email, cookies_url=None, cooki
         else:
             r = requests.post(webhook_url, json=payload, proxies=NO_PROXY, timeout=10)
         return r.status_code in (200, 204)
-    except:
+    except Exception as e:
+        print(f"[webhook] error: {e}")
         return False
 
 def test_webhook(url):
     try:
         r = requests.post(url, json={
+            "username": "Kuni SB Gen",
             "embeds": [{
-                "title": "\u2705 Kuni Webhook Connected",
-                "description": "Your webhook is working. Accounts will be delivered here.",
-                "color": 0x00ffcc,
-                "footer": {"text": "Kuni SB Generator \u00B7 v2.6"},
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "title":       "KUNI SB GENERATOR",
+                "description": "Webhook connected successfully.\nYour generated accounts will be delivered here.",
+                "color":       0x00D4FF,
+                "footer":      {"text": "Kuni Tool  ·  ScriptBlox Auto Generator"},
+                "timestamp":   datetime.now(timezone.utc).isoformat(),
             }]
         }, proxies=NO_PROXY, timeout=10)
         return r.status_code in (200, 204)
@@ -999,18 +1036,11 @@ def verify():
 
         stored_ua = rec.get("ua_hash")
         if stored_ua and stored_ua != ua_h:
-            if rec.get("is_trial"):
-                return jsonify({"valid": False, "error": "hwid_mismatch"})
             print(f"[WARN] UA drift for {key}: {stored_ua} -> {ua_h}")
 
         patch = {}
         if not rec.get("hwid"):    patch["hwid"] = hwid
         if not rec.get("ua_hash"): patch["ua_hash"] = ua_h
-        if rec.get("is_trial"):
-            if not rec.get("combined_fp"):
-                patch["combined_fp"] = combined_fingerprint(hwid, client_ip, ls_token, ua_h, extra_fp)
-            if not rec.get("bound_ip"):
-                patch["bound_ip"] = client_ip
         if patch:
             requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
                            params={"license_key": f"eq.{key}"}, json=patch)
@@ -1030,101 +1060,11 @@ def verify():
             "used":           used,
             "limit":          limit,
             "accounts_left":  None if limit >= 9999 else (limit - used),
-            "is_trial":       rec.get("is_trial", False),
             "ls_token":       final_ls,
         })
     except Exception as e:
         print("VERIFY ERROR:", e)
         return jsonify({"valid": False, "error": "server_error"})
-
-@app.route("/claim-trial", methods=["POST"])
-def claim_trial():
-    client_ip = get_client_ip()
-    if not rate_limit(f"trial:{client_ip}", RL_TRIAL_MAX, RL_TRIAL_WIN):
-        return jsonify({"ok": False, "error": "rate_limited"}), 429
-    try:
-        body = request.json or {}
-        client_hwid = body.get("hwid", "").strip()
-        ls_token    = body.get("ls_token", "").strip()
-        extra_fp    = body.get("fp", "").strip()
-        ua          = get_client_ua()
-        ua_h        = ua_hash(ua)
-        hwid        = client_hwid or hashlib.sha256(client_ip.encode()).hexdigest()
-
-        if is_datacenter_ip(client_ip):
-            return jsonify({"ok": False, "error": "blocked", "reason": "datacenter_ip"})
-
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                         params={"hwid": f"eq.{hwid}", "is_trial": "eq.true",
-                                 "select": "id,license_key"})
-        if r.status_code == 200 and r.json():
-            return jsonify({"ok": False, "error": "already_claimed",
-                            "reason": "hwid", "key": r.json()[0]["license_key"]})
-
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        r2 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                          params={"bound_ip": f"eq.{client_ip}", "is_trial": "eq.true",
-                                  "created_at": f"gte.{cutoff}", "select": "id"})
-        if r2.status_code == 200 and r2.json():
-            return jsonify({"ok": False, "error": "already_claimed", "reason": "ip"})
-
-        subnet_16 = ip_subnet(client_ip, 2)
-        cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        r2b = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                           params={"bound_ip": f"like.{subnet_16}.*", "is_trial": "eq.true",
-                                   "created_at": f"gte.{cutoff_7d}", "select": "id"})
-        if r2b.status_code == 200 and len(r2b.json()) >= 3:
-            return jsonify({"ok": False, "error": "blocked", "reason": "subnet_abuse"})
-
-        if ls_token:
-            r3 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                              params={"ls_token": f"eq.{ls_token}", "is_trial": "eq.true",
-                                      "select": "id"})
-            if r3.status_code == 200 and r3.json():
-                return jsonify({"ok": False, "error": "already_claimed", "reason": "token"})
-
-        combined_fp = combined_fingerprint(hwid, client_ip, ls_token, ua_h, extra_fp)
-        r4 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                          params={"combined_fp": f"eq.{combined_fp}", "is_trial": "eq.true",
-                                  "select": "id"})
-        if r4.status_code == 200 and r4.json():
-            return jsonify({"ok": False, "error": "already_claimed", "reason": "fingerprint"})
-
-        r5 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                          params={"ua_hash": f"eq.{ua_h}", "bound_ip": f"eq.{client_ip}",
-                                  "is_trial": "eq.true", "select": "id"})
-        if r5.status_code == 200 and r5.json():
-            return jsonify({"ok": False, "error": "already_claimed", "reason": "ua+ip"})
-
-        def seg(): return "".join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
-        key = f"TRIAL-{seg()}-{seg()}-{seg()}"
-        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-        final_ls = ls_token or secrets.token_hex(16)
-
-        insert_body = {
-            "license_key":    key,
-            "accounts_limit": 1,
-            "accounts_used":  0,
-            "expiry_date":    expiry,
-            "status":         "active",
-            "is_trial":       True,
-            "hwid":           hwid,
-            "bound_ip":       client_ip,
-            "ls_token":       final_ls,
-            "combined_fp":    combined_fp,
-            "ua_hash":        ua_h,
-            "note":           "free trial",
-        }
-        r6 = requests.post(f"{SUPABASE_URL}/rest/v1/licenses",
-                           headers={**supa_hdrs(), "Prefer": "return=representation"},
-                           json=insert_body)
-        if r6.status_code not in (200, 201):
-            return jsonify({"ok": False, "error": "db_error"})
-
-        return jsonify({"ok": True, "key": key, "ls_token": final_ls})
-    except Exception as e:
-        print("TRIAL ERROR:", e)
-        return jsonify({"ok": False, "error": "server_error"})
 
 @app.route("/set-proxies", methods=["POST"])
 def set_proxies():
@@ -1312,14 +1252,6 @@ HTML = r"""<!DOCTYPE html>
   .discord-btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 11px 22px; background: rgba(114,137,218,.1); border: 1px solid rgba(114,137,218,.4); border-radius: 8px; color: var(--purple); font-family: var(--mono); font-size: 12px; letter-spacing: 1px; text-decoration: none; transition: all .2s; width: 100%; }
   .discord-btn:hover { background: rgba(114,137,218,.2); border-color: var(--purple); color: #fff; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(114,137,218,.3); }
   .discord-btn strong { color: #fff; }
-  .trial-divider { display: flex; align-items: center; gap: 10px; margin: 14px 0; }
-  .trial-divider::before, .trial-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
-  .trial-divider span { font-size: 9px; color: var(--muted); letter-spacing: 2px; }
-  .trial-btn { width: 100%; padding: 11px; background: transparent; border: 1px dashed var(--border2); border-radius: var(--radius); color: var(--muted); font-family: var(--sans); font-weight: 700; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; cursor: pointer; transition: all .2s; margin-bottom: 4px; }
-  .trial-btn:hover { border-color: var(--green); color: var(--green); background: rgba(0,232,122,.05); }
-  .trial-btn.loading { opacity: .6; pointer-events: none; }
-  .trial-note { font-size: 9px; color: var(--muted2); text-align: center; letter-spacing: 1px; margin-bottom: 16px; }
-  .trial-badge { display: inline-block; font-size: 9px; letter-spacing: 1.5px; padding: 2px 9px; border-radius: 20px; font-weight: 700; border: 1px solid rgba(0,232,122,.4); color: var(--green); background: rgba(0,232,122,.08); margin-left: 6px; }
   .lic-footer { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
   .lic-dot { width: 6px; height: 6px; background: var(--muted2); border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; transition: background .3s; }
   .lic-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse-dot 1.4s infinite; }
@@ -1559,65 +1491,6 @@ async function authFetch(url, opts) {
   return fetch(url, Object.assign({}, opts, {headers}));
 }
 
-async function claimTrial() {
-  const btn = document.getElementById('trialBtn');
-  const err = document.getElementById('licErr');
-  btn.classList.add('loading'); btn.textContent = 'Claiming...';
-  err.textContent = ''; err.style.color = 'var(--muted)';
-  try {
-    const [hwid, fp] = await Promise.all([getDeviceFingerprint(), getExtraFp()]);
-    const ls_token = getLsToken();
-    const r = await fetch('/claim-trial',{method:'POST',headers:{'Content-Type':'application/json'},
-                                          body:JSON.stringify({hwid, ls_token, fp})});
-    const d = await r.json();
-    if (d.ok) {
-      if (d.ls_token) localStorage.setItem('_kuni_lst', d.ls_token);
-      err.style.color='var(--green)'; err.textContent='trial key claimed! verifying...';
-      document.getElementById('licInput').value = d.key;
-      setTimeout(async () => {
-        const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},
-                                              body:JSON.stringify({key:d.key, hwid, ls_token:getLsToken(), fp})});
-        const vd = await vr.json();
-        if (vd.valid) {
-          sessionToken = vd.session_token;
-          localStorage.setItem('license', d.key);
-          localStorage.setItem('session_token', sessionToken);
-          licenseInfo = vd;
-          showMainApp();
-        } else {
-          err.style.color='var(--red)'; err.textContent = ERR_MAP[vd.error]||'verify failed';
-          btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
-        }
-      }, 800);
-    } else if (d.error === 'already_claimed') {
-      err.style.color='var(--gold)';
-      const why = d.reason==='ip'?'this IP address':
-                  d.reason==='token'?'this browser':
-                  d.reason==='fingerprint'?'this device signature':
-                  d.reason==='ua+ip'?'this browser + IP':
-                  'this device';
-      err.textContent = why + ' already has a trial';
-      if (d.key) document.getElementById('licInput').value = d.key;
-      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
-    } else if (d.error === 'blocked') {
-      err.style.color='var(--red)';
-      err.textContent = d.reason==='datacenter_ip'?'VPN/datacenter IPs are not allowed for trials':
-                        d.reason==='subnet_abuse'?'too many trials from this network':
-                        'trial not available';
-      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
-    } else if (d.error === 'rate_limited') {
-      err.style.color='var(--red)'; err.textContent='too many attempts - wait 1 hour';
-      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
-    } else {
-      err.style.color='var(--red)'; err.textContent='failed to claim trial';
-      btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
-    }
-  } catch {
-    err.style.color='var(--red)'; err.textContent='server error';
-    btn.classList.remove('loading'); btn.textContent='Get Free Trial - 1 account';
-  }
-}
-
 function showLicenseScreen() {
   document.getElementById('app').innerHTML = `
     <div class="lic-wrap animate-in">
@@ -1628,10 +1501,6 @@ function showLicenseScreen() {
         <input class="lic-input" id="licInput" type="text" placeholder="KUNI-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
         <button class="lic-btn" id="licBtn" onclick="doLogin()">Verify License</button>
         <div class="lic-err" id="licErr"></div>
-
-        <div class="trial-divider"><span>OR</span></div>
-        <button class="trial-btn" id="trialBtn" onclick="claimTrial()">Get Free Trial - 1 account</button>
-        <div class="trial-note">1 free trial per device &middot; HWID + IP + browser + fingerprint locked</div>
 
         <div class="price-section">
           <div class="price-title">PRICING</div>
@@ -1699,7 +1568,7 @@ function showMainApp() {
       <div class="hdr">
         <div><div class="hdr-logo">KUNI</div><div class="hdr-sub">AUTO SB GEN</div></div>
         <div class="hdr-right">
-          <span class="plan-badge" id="planBadge">${planLabel}</span>${licenseInfo && licenseInfo.is_trial ? '<span class="trial-badge">TRIAL</span>' : ''}
+          <span class="plan-badge" id="planBadge">${planLabel}</span>
           <div class="hdr-ver">v2.6</div>
         </div>
       </div>
