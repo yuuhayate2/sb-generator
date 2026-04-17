@@ -1,8 +1,8 @@
-# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.4
+# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.5
 # Deploy on Railway / Render — open http://localhost:5000
 
-import json, os, random, re, string, threading, hashlib
-from datetime import datetime, timezone
+import json, os, random, re, string, threading, hashlib, secrets
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -30,15 +30,15 @@ PROXIES_FILE  = Path(__file__).parent / "proxies.txt"
 WEBHOOK_FILE  = Path(__file__).parent / "webhook.txt"
 
 # ── State ─────────────────────────────────────────────────────────────────────
-proxies_list   = load_proxies()          # loaded from file on start
-active_webhook = ""                      # loaded from file on start
+proxies_list   = load_proxies()
+active_webhook = ""
 license_valid  = False
 current_key    = None
 license_record = None
 session_lock   = threading.Lock()
 file_lock      = threading.Lock()
+counter_lock   = threading.Lock()  # NEW: atomic counter operations
 
-# Load saved webhook from file if exists
 if WEBHOOK_FILE.exists():
     active_webhook = WEBHOOK_FILE.read_text().strip()
 
@@ -63,18 +63,34 @@ def fetch_license(key):
     return None
 
 def increment_used(key):
-    try:
-        rec = fetch_license(key)
-        if not rec: return None
-        new_val = (rec.get("accounts_used") or 0) + 1
-        r = requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers={**supa_hdrs(), "Prefer": "return=representation"},
-                           params={"license_key": f"eq.{key}"}, json={"accounts_used": new_val})
-        return new_val if r.status_code in (200, 201) else None
-    except:
-        return None
+    """Atomic increment. Returns new value or None on fail. Only call AFTER confirmed signup."""
+    with counter_lock:
+        try:
+            rec = fetch_license(key)
+            if not rec: return None
+            new_val = (rec.get("accounts_used") or 0) + 1
+            r = requests.patch(f"{SUPABASE_URL}/rest/v1/licenses",
+                               headers={**supa_hdrs(), "Prefer": "return=representation"},
+                               params={"license_key": f"eq.{key}"},
+                               json={"accounts_used": new_val})
+            return new_val if r.status_code in (200, 201) else None
+        except:
+            return None
+
+def get_client_ip():
+    """Get real client IP, respecting proxies."""
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd: return fwd.split(",")[0].strip()
+    return request.headers.get("X-Real-IP") or request.remote_addr or "0.0.0.0"
 
 def get_hwid(ip):
     return hashlib.sha256(ip.encode()).hexdigest()
+
+def compute_combined_fp(hwid, ip, ls_token):
+    """Combined fingerprint: HWID + IP prefix + localStorage token."""
+    ip_prefix = ".".join(ip.split(".")[:3]) if "." in ip else ip[:8]  # /24 subnet for IPv4
+    raw = f"{hwid}|{ip_prefix}|{ls_token or ''}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 # ── MailWave ──────────────────────────────────────────────────────────────────
 def mw_setup():
@@ -104,30 +120,126 @@ def mw_get_email(cookies, csrf):
             pass
     return None, csrf
 
-# ── Discord Webhook ───────────────────────────────────────────────────────────
-def send_webhook(username, password, email):
-    if not active_webhook: return
+# ── Cookie extraction from signup response ───────────────────────────────────
+def extract_session_cookies(response, resp_json):
+    """Extract session cookies from SB signup response. Returns list of cookie dicts in browser format."""
+    cookies = []
+
+    # 1. Extract from Set-Cookie headers
+    for cookie in response.cookies:
+        cookies.append({
+            "domain": ".scriptblox.com",
+            "hostOnly": False,
+            "httpOnly": True,
+            "name": cookie.name,
+            "path": cookie.path or "/",
+            "sameSite": "lax",
+            "secure": cookie.secure,
+            "session": not cookie.expires,
+            "storeId": None,
+            "value": cookie.value,
+        })
+
+    # 2. Extract token from JSON body (common patterns)
+    token = None
+    if isinstance(resp_json, dict):
+        # Try common token field names
+        for field in ("token", "accessToken", "access_token", "jwt", "sessionToken"):
+            if resp_json.get(field):
+                token = resp_json[field]
+                break
+        # Nested user object
+        if not token and isinstance(resp_json.get("user"), dict):
+            for field in ("token", "accessToken"):
+                if resp_json["user"].get(field):
+                    token = resp_json["user"][field]
+                    break
+
+    if token:
+        cookies.append({
+            "domain": "scriptblox.com",
+            "hostOnly": True,
+            "httpOnly": False,
+            "name": "__scriptblox_validation",
+            "path": "/",
+            "sameSite": "lax",
+            "secure": True,
+            "session": False,
+            "storeId": None,
+            "value": token,
+        })
+
+    return cookies
+
+def upload_cookies_to_sourcebin(cookies_json):
+    """Upload cookies.json to sourceb.in and return the URL."""
     try:
-        embed = {
-            "title": "🎯 New Account Generated", "color": 0x00ffcc,
-            "description": f"**{username}** | {email}",
-            "fields": [
-                {"name": "👤 Username", "value": f"```{username}```", "inline": True},
-                {"name": "🔑 Password", "value": f"```{password}```", "inline": True},
-                {"name": "📧 Email",    "value": f"```{email}```",    "inline": False},
-                {"name": "📅 Created",  "value": datetime.now(timezone.utc).strftime("%b %d, %Y"), "inline": True},
-                {"name": "⚡ Status",   "value": "⚠️ Unverified", "inline": True},
-            ],
-            "footer": {"text": "Kuni SB Generator · v2.4"},
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        requests.post(active_webhook, json={"embeds": [embed]}, proxies=NO_PROXY, timeout=10)
+        r = requests.post("https://sourceb.in/api/bins",
+                          json={"files": [{"name": "cookies.json", "content": cookies_json}]},
+                          timeout=15, proxies=NO_PROXY)
+        if r.status_code in (200, 201):
+            data = r.json()
+            key = data.get("key") or data.get("bin", {}).get("key")
+            if key: return f"https://cdn.sourceb.in/bins/{key}/0"
     except:
         pass
+    return None
+
+# ── Discord Webhook ───────────────────────────────────────────────────────────
+def send_webhook(username, password, email, cookies_url=None, cookies_json=None):
+    if not active_webhook: return False
+    try:
+        fields = [
+            {"name": "👤 Username", "value": f"```{username}```", "inline": True},
+            {"name": "🔑 Password", "value": f"```{password}```", "inline": True},
+            {"name": "📧 Email",    "value": f"```{email}```",    "inline": False},
+            {"name": "📅 Created",  "value": datetime.now(timezone.utc).strftime("%b %d, %Y"), "inline": True},
+            {"name": "⚡ Status",   "value": "✅ Verified" if cookies_url else "⚠️ Unverified", "inline": True},
+        ]
+        if cookies_url:
+            fields.append({"name": "🍪 Cookies", "value": f"[cookies.json]({cookies_url})", "inline": False})
+
+        embed = {
+            "title": "🎯 New Account Generated",
+            "color": 0x00ffcc,
+            "description": f"**{username}** | {email}",
+            "fields": fields,
+            "footer": {"text": "Kuni SB Generator · v2.5"},
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        payload = {"embeds": [embed]}
+        files = None
+        if cookies_json and not cookies_url:
+            # Attach as file if sourcebin failed
+            files = {"cookies.json": ("cookies.json", cookies_json, "application/json")}
+            r = requests.post(active_webhook, data={"payload_json": json.dumps(payload)},
+                              files=files, proxies=NO_PROXY, timeout=15)
+        else:
+            r = requests.post(active_webhook, json=payload, proxies=NO_PROXY, timeout=10)
+        return r.status_code in (200, 204)
+    except:
+        return False
+
+def test_webhook(url):
+    """Quick ping to verify webhook is alive."""
+    try:
+        r = requests.post(url, json={
+            "embeds": [{
+                "title": "✅ Kuni Webhook Connected",
+                "description": "Your webhook is working. Accounts will be delivered here.",
+                "color": 0x00ffcc,
+                "footer": {"text": "Kuni SB Generator · v2.5"},
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }]
+        }, proxies=NO_PROXY, timeout=10)
+        return r.status_code in (200, 204)
+    except:
+        return False
 
 # ── Utils ─────────────────────────────────────────────────────────────────────
 def rand_username(): return "Kuni" + "".join(random.choices(string.ascii_letters + string.digits, k=10))
-def rand_password():  return "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=14))
+def rand_password(): return "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=14))
 
 def proxy_to_requests(proxy):
     if not proxy: return None
@@ -155,23 +267,26 @@ def create_account(slot):
     global current_key, license_record
     if state["stop"]: return
 
-    # Check limit before this slot
+    # Pre-check limit atomically
     if license_record:
         limit = license_record.get("accounts_limit", 0)
         if limit < 9999:
-            rec = fetch_license(current_key)
-            if rec:
-                used = rec.get("accounts_used") or 0
-                if used >= limit:
-                    state["stop"] = True
-                    log_emit(f"Account limit reached ({used}/{limit}) — stopping", "err")
-                    socketio.emit("limit_reached", {"used": used, "limit": limit})
-                    return
+            with counter_lock:
+                rec = fetch_license(current_key)
+                if rec:
+                    used = rec.get("accounts_used") or 0
+                    if used >= limit:
+                        state["stop"] = True
+                        log_emit(f"Account limit reached ({used}/{limit}) — stopping", "err")
+                        socketio.emit("limit_reached", {"used": used, "limit": limit})
+                        return
 
     username = rand_username()
     password = rand_password()
     proxy    = get_random_proxy(proxies_list)
     proxy_r  = proxy_to_requests(proxy)
+
+    log_emit(f"[#{slot}] setting up email + captcha...", "dim")
 
     cookies, csrf = mw_setup()
     captcha       = solve_turnstile_capsolver()
@@ -179,40 +294,61 @@ def create_account(slot):
 
     if not email_addr or not captcha:
         state["failed"] += 1
-        log_emit(f"[#{slot}] Setup failed (email/captcha)", "err")
-        return
+        log_emit(f"[#{slot}] ✗ setup failed (email/captcha)", "err")
+        return  # no rollback needed — never incremented
 
-    log_emit(f"[#{slot}] preparing account...", "dim")
+    log_emit(f"[#{slot}] submitting signup...", "dim")
 
+    # Attempt signup
     try:
         r = requests.post(SB_SIGNUP, json={
             "email": email_addr, "username": username,
             "password": password, "repeatPassword": password,
             "terms": True, "captcha": captcha,
         }, headers=sb_headers(), proxies=proxy_r, timeout=30, verify=False)
-        resp = r.json()
-    except:
+        resp = r.json() if r.content else {}
+    except Exception as e:
         state["failed"] += 1
-        log_emit(f"[#{slot}] Request error", "err")
+        log_emit(f"[#{slot}] ✗ request error: {str(e)[:50]}", "err")
         return
 
+    # Validate response
     if resp.get("error") or (isinstance(resp.get("statusCode"), int) and resp["statusCode"] >= 400):
         state["failed"] += 1
-        log_emit(f"[#{slot}] Signup failed: {resp.get('message','')}", "err")
+        log_emit(f"[#{slot}] ✗ signup failed: {resp.get('message','')}", "err")
         return
 
-    # Success — increment DB counter
-    with session_lock:
-        increment_used(current_key)
+    # Extract cookies/tokens
+    session_cookies = extract_session_cookies(r, resp)
+    cookies_url = None
+    cookies_json_str = None
+    if session_cookies:
+        cookies_json_str = json.dumps(session_cookies, indent=2)
+        cookies_url = upload_cookies_to_sourcebin(cookies_json_str)
+        if cookies_url:
+            log_emit(f"[#{slot}] cookies uploaded → {cookies_url}", "dim")
 
-    account = {"username": username, "password": password, "email": email_addr}
+    # Send webhook FIRST — if this fails, still save locally but warn
+    webhook_ok = send_webhook(username, password, email_addr, cookies_url, cookies_json_str)
+    if not webhook_ok:
+        log_emit(f"[#{slot}] ⚠ webhook delivery failed — account saved locally only", "err")
+
+    # Save to file
+    account = {
+        "username": username, "password": password, "email": email_addr,
+        "cookies_url": cookies_url, "has_session": bool(session_cookies),
+    }
     with file_lock:
         with open(ACCOUNTS_FILE, "a") as f:
             f.write(json.dumps(account) + "\n")
 
-    send_webhook(username, password, email_addr)
+    # Increment counter ONLY after confirmed success
+    with session_lock:
+        increment_used(current_key)
+
     state["created"] += 1
-    log_emit(f"[#{slot}] ✓ {username} | {password}", "ok")
+    verified_mark = "🍪" if cookies_url else "✓"
+    log_emit(f"[#{slot}] {verified_mark} {username} | {password}", "ok")
 
 def run_generator(count, concurrent):
     sem = threading.Semaphore(concurrent)
@@ -221,8 +357,10 @@ def run_generator(count, concurrent):
         with sem:
             if not state["stop"]:
                 state["active"] += 1
-                create_account(slot)
-                state["active"] -= 1
+                try:
+                    create_account(slot)
+                finally:
+                    state["active"] -= 1
     for i in range(count):
         if state["stop"]: break
         t = threading.Thread(target=worker, args=(i+1,), daemon=True)
@@ -237,26 +375,58 @@ def run_generator(count, concurrent):
 def verify():
     global license_valid, current_key, license_record
     try:
-        key = (request.json or {}).get("key","").strip()
+        body = request.json or {}
+        key = body.get("key","").strip()
         if not key: return jsonify({"valid": False, "error": "no_key"})
-        # Use client-sent device fingerprint if provided, fallback to IP
-        client_hwid = (request.json or {}).get("hwid", "").strip()
-        hwid = client_hwid if client_hwid else get_hwid(request.remote_addr)
-        rec  = fetch_license(key)
+
+        client_hwid = body.get("hwid", "").strip()
+        client_ip   = get_client_ip()
+        ls_token    = body.get("ls_token", "").strip()
+
+        hwid = client_hwid if client_hwid else get_hwid(client_ip)
+
+        rec = fetch_license(key)
         if not rec:  return jsonify({"valid": False, "error": "not_found"})
         if rec.get("status") != "active": return jsonify({"valid": False, "error": "disabled"})
+
         exp = rec.get("expiry_date")
-        if exp and datetime.fromisoformat(exp.replace("Z","")) < datetime.now():
-            return jsonify({"valid": False, "error": "expired"})
+        if exp:
+            try:
+                exp_dt = datetime.fromisoformat(exp.replace("Z","+00:00"))
+                if exp_dt.tzinfo is None: exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if exp_dt < datetime.now(timezone.utc):
+                    return jsonify({"valid": False, "error": "expired"})
+            except:
+                pass
+
+        # HWID check — strict for all keys, especially trials
         if rec.get("hwid") and rec["hwid"] != hwid:
             return jsonify({"valid": False, "error": "hwid_mismatch"})
+
+        # Extra trial protection: check combined fingerprint match
+        if rec.get("is_trial"):
+            stored_fp = rec.get("combined_fp")
+            current_fp = compute_combined_fp(hwid, client_ip, ls_token)
+            if stored_fp and stored_fp != current_fp:
+                # IP changed or localStorage cleared — still allow if HWID matches,
+                # but flag this as suspicious for logs
+                print(f"[TRIAL] fp drift for {key}: {stored_fp[:8]}... → {current_fp[:8]}...")
+
+        # Bind HWID if first use
         if not rec.get("hwid"):
+            patch_body = {"hwid": hwid}
+            if rec.get("is_trial"):
+                patch_body["combined_fp"] = compute_combined_fp(hwid, client_ip, ls_token)
+                patch_body["bound_ip"] = client_ip
             requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                           params={"license_key": f"eq.{key}"}, json={"hwid": hwid})
+                           params={"license_key": f"eq.{key}"}, json=patch_body)
+
+        # Account limit check
         limit = rec.get("accounts_limit", 0)
         used  = rec.get("accounts_used", 0) or 0
         if limit < 9999 and used >= limit:
             return jsonify({"valid": False, "error": "limit_reached", "used": used, "limit": limit})
+
         license_valid = True; current_key = key; license_record = rec
         return jsonify({
             "valid": True,
@@ -264,10 +434,87 @@ def verify():
             "used":  used, "limit": limit,
             "accounts_left": None if limit >= 9999 else (limit - used),
             "is_trial": rec.get("is_trial", False),
+            "ls_token": ls_token or secrets.token_hex(16),  # give client a token to persist
         })
     except Exception as e:
         print("VERIFY ERROR:", e)
         return jsonify({"valid": False, "error": "server_error"})
+
+@app.route("/claim-trial", methods=["POST"])
+def claim_trial():
+    try:
+        body = request.json or {}
+        client_hwid = body.get("hwid", "").strip()
+        ls_token    = body.get("ls_token", "").strip()
+        client_ip   = get_client_ip()
+        hwid = client_hwid if client_hwid else get_hwid(client_ip)
+
+        # STRICT CHECK 1: HWID already used for trial?
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                         params={"hwid": f"eq.{hwid}", "is_trial": "eq.true",
+                                 "select": "id,license_key"})
+        if r.status_code == 200 and r.json():
+            existing = r.json()[0]
+            return jsonify({"ok": False, "error": "already_claimed",
+                            "key": existing["license_key"], "reason": "hwid"})
+
+        # STRICT CHECK 2: IP already claimed a trial in last 30 days?
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        r2 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                          params={"bound_ip": f"eq.{client_ip}", "is_trial": "eq.true",
+                                  "created_at": f"gte.{cutoff}",
+                                  "select": "id,license_key"})
+        if r2.status_code == 200 and r2.json():
+            return jsonify({"ok": False, "error": "already_claimed", "reason": "ip"})
+
+        # STRICT CHECK 3: localStorage token already bound to a trial?
+        if ls_token:
+            r3 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                              params={"ls_token": f"eq.{ls_token}", "is_trial": "eq.true",
+                                      "select": "id,license_key"})
+            if r3.status_code == 200 and r3.json():
+                return jsonify({"ok": False, "error": "already_claimed", "reason": "token"})
+
+        # STRICT CHECK 4: combined fingerprint match?
+        combined_fp = compute_combined_fp(hwid, client_ip, ls_token)
+        r4 = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
+                          params={"combined_fp": f"eq.{combined_fp}", "is_trial": "eq.true",
+                                  "select": "id,license_key"})
+        if r4.status_code == 200 and r4.json():
+            return jsonify({"ok": False, "error": "already_claimed", "reason": "fingerprint"})
+
+        # All checks passed — issue new trial
+        def seg(): return "".join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
+        key = f"TRIAL-{seg()}-{seg()}-{seg()}"
+
+        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+        # Generate a new ls_token if client didn't send one
+        final_ls_token = ls_token or secrets.token_hex(16)
+
+        body_insert = {
+            "license_key":    key,
+            "accounts_limit": 1,
+            "accounts_used":  0,
+            "expiry_date":    expiry,
+            "status":         "active",
+            "is_trial":       True,
+            "hwid":           hwid,
+            "bound_ip":       client_ip,
+            "ls_token":       final_ls_token,
+            "combined_fp":    combined_fp,
+            "note":           "free trial",
+        }
+        r5 = requests.post(f"{SUPABASE_URL}/rest/v1/licenses",
+                           headers={**supa_hdrs(), "Prefer": "return=representation"},
+                           json=body_insert)
+        if r5.status_code not in (200, 201):
+            return jsonify({"ok": False, "error": "db_error"})
+
+        return jsonify({"ok": True, "key": key, "ls_token": final_ls_token})
+    except Exception as e:
+        print("TRIAL ERROR:", e)
+        return jsonify({"ok": False, "error": "server_error"})
 
 @app.route("/set-proxies", methods=["POST"])
 def set_proxies():
@@ -290,9 +537,15 @@ def set_webhook():
         wh = (request.json or {}).get("webhook","").strip()
         if wh and not wh.startswith("https://discord.com/api/webhooks/"):
             return jsonify({"ok": False, "error": "invalid_webhook"})
+
+        # Test webhook before saving
+        if wh:
+            if not test_webhook(wh):
+                return jsonify({"ok": False, "error": "webhook_unreachable"})
+
         active_webhook = wh
-        WEBHOOK_FILE.write_text(wh)   # persist to file so it survives restarts
-        return jsonify({"ok": True})
+        WEBHOOK_FILE.write_text(wh)
+        return jsonify({"ok": True, "tested": bool(wh)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
@@ -315,10 +568,19 @@ def on_info():
 def on_start(data):
     global license_record
     if not license_valid or state["running"]: return
+
+    # BLOCK START IF NO WEBHOOK
+    if not active_webhook:
+        emit("start_blocked", {"reason": "webhook_required",
+                               "message": "Set a Discord webhook first. Accounts cannot be delivered without it."})
+        log_emit("⚠ Cannot start — webhook required. Set a Discord webhook first.", "err")
+        return
+
     # Refresh record
     if current_key:
         fresh = fetch_license(current_key)
         if fresh: license_record = fresh
+
     limit = license_record.get("accounts_limit", 0) if license_record else 0
     used  = (license_record.get("accounts_used") or 0) if license_record else 0
     if limit < 9999 and used >= limit:
@@ -386,7 +648,6 @@ HTML = r"""<!DOCTYPE html>
   .lic-btn.loading { opacity: .7; pointer-events: none; }
   .lic-err { font-size: 11px; min-height: 18px; margin-top: 10px; text-align: center; letter-spacing: .5px; color: var(--red); }
 
-  /* pricelist */
   .price-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--border); }
   .price-title { font-size: 9px; letter-spacing: 3px; color: var(--muted); margin-bottom: 12px; text-align: center; }
   .price-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; min-width: 0; }
@@ -400,7 +661,6 @@ HTML = r"""<!DOCTYPE html>
   .price-php { font-size: 9px; color: var(--muted); letter-spacing: 1px; margin-top: 2px; }
   .price-card.featured .price-amt { color: var(--green); }
 
-  /* discord contact */
   .discord-section { text-align: center; }
   .discord-label { font-size: 10px; color: var(--muted); letter-spacing: 1.5px; margin-bottom: 10px; }
   .discord-btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 11px 22px; background: rgba(114,137,218,.1); border: 1px solid rgba(114,137,218,.4); border-radius: 8px; color: var(--purple); font-family: var(--mono); font-size: 12px; letter-spacing: 1px; text-decoration: none; transition: all .2s; width: 100%; }
@@ -414,7 +674,7 @@ HTML = r"""<!DOCTYPE html>
   .trial-btn.loading { opacity: .6; pointer-events: none; }
   .trial-note { font-size: 9px; color: var(--muted2); text-align: center; letter-spacing: 1px; margin-bottom: 16px; }
   .trial-badge { display: inline-block; font-size: 9px; letter-spacing: 1.5px; padding: 2px 9px; border-radius: 20px; font-weight: 700; border: 1px solid rgba(0,232,122,.4); color: var(--green); background: rgba(0,232,122,.08); margin-left: 6px; }
-    .lic-footer { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .lic-footer { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
   .lic-dot { width: 6px; height: 6px; background: var(--muted2); border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; transition: background .3s; }
   .lic-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse-dot 1.4s infinite; }
 
@@ -443,7 +703,6 @@ HTML = r"""<!DOCTYPE html>
   .stat-lbl { font-size: 8px; color: var(--muted); letter-spacing: 2px; margin-top: 5px; display: block; }
   .s-created .stat-val { color: var(--green); } .s-active .stat-val { color: var(--cyan); } .s-failed .stat-val { color: var(--red); } .s-target .stat-val { color: var(--gold); }
 
-  /* limit bar */
   .limit-bar-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; }
   .limit-bar-top { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-bottom: 8px; letter-spacing: 1px; }
   .limit-bar-top span:last-child { color: var(--text); }
@@ -451,7 +710,6 @@ HTML = r"""<!DOCTYPE html>
   .limit-bar-fill { height: 100%; background: var(--cyan); border-radius: 4px; transition: width .4s ease; }
   .limit-bar-fill.warn { background: var(--gold); } .limit-bar-fill.danger { background: var(--red); }
 
-  /* config card */
   .config-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .config-card-hdr { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 2px; color: var(--muted); cursor: pointer; user-select: none; transition: background .15s; }
   .config-card-hdr:hover { background: var(--surface2); }
@@ -463,12 +721,12 @@ HTML = r"""<!DOCTYPE html>
   .config-input { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--cyan); font-family: var(--mono); font-size: 13px; padding: 6px 10px; width: 72px; outline: none; transition: border-color .2s, box-shadow .2s; }
   .config-input:focus { border-color: var(--cyan); box-shadow: 0 0 0 2px var(--cyan-dim); }
 
-  /* proxy panel */
   .panel-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
   .panel-label { font-size: 10px; letter-spacing: 2px; color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; cursor: pointer; user-select: none; }
   .panel-label:hover { color: var(--text); }
   .panel-label .badge { font-size: 9px; color: var(--muted2); }
   .panel-label .badge.ok { color: var(--green); }
+  .panel-label .badge.req { color: var(--red); }
   .panel-inner { display: none; }
   .panel-inner.open { display: block; }
   .panel-textarea { width: 100%; min-height: 80px; padding: 10px 12px; resize: vertical; background: transparent; border: none; outline: none; color: var(--cyan); font-family: var(--mono); font-size: 11px; line-height: 1.7; }
@@ -478,14 +736,17 @@ HTML = r"""<!DOCTYPE html>
   .panel-btn:hover { background: var(--cyan); color: var(--bg); }
   .panel-status { font-size: 10px; color: var(--muted); letter-spacing: 1px; margin-left: auto; transition: color .2s; }
 
-  /* webhook row */
-  .webhook-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  /* webhook required wrapper */
+  .webhook-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; transition: border-color .3s; }
+  .webhook-wrap.required { border-color: rgba(255,59,92,.5); box-shadow: 0 0 0 1px rgba(255,59,92,.2); }
   .webhook-row { display: flex; align-items: center; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border); }
   .webhook-lbl { font-size: 10px; letter-spacing: 2px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+  .webhook-wrap.required .webhook-lbl { color: var(--red); }
   .webhook-input { flex: 1; padding: 10px 8px; background: transparent; border: none; outline: none; color: var(--cyan); font-family: var(--mono); font-size: 11px; }
   .webhook-input::placeholder { color: var(--muted2); }
+  .webhook-req-note { font-size: 9px; padding: 4px 12px 2px; color: var(--red); letter-spacing: 1px; display: none; }
+  .webhook-wrap.required .webhook-req-note { display: block; }
 
-  /* tutorial video */
   .tutorial-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .tutorial-hdr { padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 2px; color: var(--muted); display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; transition: background .15s; }
   .tutorial-hdr:hover { background: var(--surface2); }
@@ -493,17 +754,8 @@ HTML = r"""<!DOCTYPE html>
   .tutorial-body { display: none; padding: 16px; }
   .tutorial-body.open { display: block; }
   .video-container { position: relative; width: 100%; padding-top: 56.25%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
-  .video-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
-  .video-placeholder-icon { width: 48px; height: 48px; border: 2px solid var(--border2); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: var(--muted); }
-  .video-placeholder-text { font-size: 10px; color: var(--muted); letter-spacing: 1px; text-align: center; }
-  .video-el { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  .tutorial-steps { display: flex; flex-direction: column; gap: 8px; }
-  .step { display: flex; gap: 12px; align-items: flex-start; }
-  .step-num { width: 20px; height: 20px; border-radius: 50%; background: var(--cyan-dim); border: 1px solid rgba(0,212,255,.3); color: var(--cyan); font-size: 9px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
-  .step-text { font-size: 11px; color: var(--text); line-height: 1.6; }
-  .step-text span { color: var(--cyan); }
+  .video-el { position: absolute; inset: 0; width: 100%; height: 100%; }
 
-  /* run button */
   .run-btn { width: 100%; padding: 15px; border: none; border-radius: var(--radius); font-family: var(--sans); font-weight: 700; font-size: 13px; letter-spacing: 3px; text-transform: uppercase; cursor: pointer; transition: all .2s; }
   .run-btn.idle { background: transparent; border: 1px solid var(--cyan); color: var(--cyan); }
   .run-btn.idle:hover { background: var(--cyan); color: var(--bg); box-shadow: 0 6px 24px var(--cyan-glow); transform: translateY(-1px); }
@@ -512,11 +764,15 @@ HTML = r"""<!DOCTYPE html>
   .run-btn.disabled-btn { opacity: .4; pointer-events: none; border: 1px solid var(--muted); color: var(--muted); background: transparent; }
   .run-btn:active { transform: scale(.99); }
 
-  /* limit banner */
+  /* warning banner (webhook required, etc) */
+  .warn-banner { background: rgba(245,200,66,.08); border: 1px solid rgba(245,200,66,.35); border-radius: var(--radius); padding: 12px 16px; font-size: 11px; color: var(--gold); letter-spacing: .3px; display: none; align-items: flex-start; gap: 10px; line-height: 1.5; }
+  .warn-banner.show { display: flex; animation: fadeIn .2s ease; }
+  .warn-banner .warn-icon { font-size: 14px; flex-shrink: 0; line-height: 1; margin-top: 1px; }
+  .warn-banner strong { color: #fff; }
+
   .limit-banner { background: rgba(255,59,92,.08); border: 1px solid rgba(255,59,92,.3); border-radius: var(--radius); padding: 12px 16px; font-size: 11px; color: var(--red); letter-spacing: .5px; display: none; align-items: center; gap: 10px; }
   .limit-banner.show { display: flex; }
 
-  /* log */
   .log-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .log-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 2px; color: var(--muted); }
   .log-clear { font-size: 10px; color: var(--muted2); background: none; border: none; cursor: pointer; font-family: var(--mono); padding: 2px 6px; border-radius: 4px; transition: color .2s, background .2s; }
@@ -549,10 +805,19 @@ const ERR_MAP = {
   server_error:  'server error — try again later',
 };
 
+// ── LOCAL STORAGE TOKEN (for trial binding) ──────────────────────────────────
+function getLsToken() {
+  let t = localStorage.getItem('_kuni_lst');
+  if (!t) {
+    t = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2,'0')).join('');
+    localStorage.setItem('_kuni_lst', t);
+  }
+  return t;
+}
+
 // ── DEVICE FINGERPRINT ───────────────────────────────────────────────────────
 async function getDeviceFingerprint() {
   try {
-    // Canvas fingerprint
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     ctx.textBaseline = 'top';
@@ -574,14 +839,12 @@ async function getDeviceFingerprint() {
       navigator.hardwareConcurrency || 0,
       navigator.platform,
       navigator.maxTouchPoints || 0,
-      canvasData.slice(-64), // last 64 chars of canvas data
+      canvasData.slice(-64),
     ].join('|');
 
-    // SHA-256 the fingerprint
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
     return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
   } catch {
-    // Fallback — random persistent ID stored in localStorage
     let id = localStorage.getItem('_did');
     if (!id) { id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); localStorage.setItem('_did', id); }
     return id;
@@ -596,27 +859,36 @@ async function claimTrial() {
   err.textContent = ''; err.style.color = 'var(--muted)';
   try {
     const hwid = await getDeviceFingerprint();
-    const r = await fetch('/claim-trial', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hwid})});
+    const ls_token = getLsToken();
+    const r = await fetch('/claim-trial', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hwid, ls_token})});
     const d = await r.json();
     if (d.ok) {
-      // Auto-fill and verify the trial key
+      if (d.ls_token) localStorage.setItem('_kuni_lst', d.ls_token);
       err.style.color = 'var(--green)'; err.textContent = 'trial key claimed! verifying...';
       const input = document.getElementById('licInput');
       if (input) { input.value = d.key; }
-      // Auto verify
       setTimeout(async () => {
-        const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:d.key, hwid})});
+        const vr = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},
+                                              body:JSON.stringify({key:d.key, hwid, ls_token: getLsToken()})});
         const vd = await vr.json();
         if (vd.valid) {
           localStorage.setItem('license', d.key);
           licenseInfo = vd;
           showMainApp();
+        } else {
+          err.style.color='var(--red)';
+          err.textContent = ERR_MAP[vd.error] || 'verify failed';
+          btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
         }
       }, 800);
     } else if (d.error === 'already_claimed') {
       err.style.color = 'var(--gold)';
-      err.textContent = 'device already has a trial — enter your key above';
-      if (document.getElementById('licInput')) document.getElementById('licInput').value = d.key;
+      const reason = d.reason === 'ip' ? 'this IP address' :
+                     d.reason === 'token' ? 'this browser' :
+                     d.reason === 'fingerprint' ? 'this device signature' :
+                     'this device';
+      err.textContent = `${reason} already has a trial`;
+      if (d.key && document.getElementById('licInput')) document.getElementById('licInput').value = d.key;
       btn.classList.remove('loading'); btn.textContent = '🎁 Get Free Trial — 1 account';
     } else {
       err.style.color = 'var(--red)'; err.textContent = 'failed to claim trial — try again';
@@ -634,7 +906,7 @@ function showLicenseScreen() {
     <div class="lic-wrap animate-in">
       <div class="lic-card">
         <div class="lic-logo">KUNI</div>
-        <div class="lic-sub">Auto SB Gen &nbsp;·&nbsp; v2.4</div>
+        <div class="lic-sub">Auto SB Gen &nbsp;·&nbsp; v2.5</div>
         <span class="lic-label">LICENSE KEY</span>
         <input class="lic-input" id="licInput" type="text" placeholder="KUNI-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
         <button class="lic-btn" id="licBtn" onclick="doLogin()">Verify License</button>
@@ -642,32 +914,14 @@ function showLicenseScreen() {
 
         <div class="trial-divider"><span>OR</span></div>
         <button class="trial-btn" id="trialBtn" onclick="claimTrial()">🎁 Get Free Trial — 1 account</button>
-        <div class="trial-note">1 free trial per device · 1 account · HWID locked</div>
+        <div class="trial-note">1 free trial per device · HWID + IP + browser locked</div>
 
         <div class="price-section">
           <div class="price-title">PRICING</div>
           <div class="price-grid">
-            <div class="price-card">
-              <div class="price-name">BASIC</div>
-              <div class="price-limit">100 accounts</div>
-              <div class="price-amt">$59.99</div>
-              <div class="price-php">≈ ₱3,389</div>
-              <div class="price-dur">30 days</div>
-            </div>
-            <div class="price-card featured">
-              <div class="price-name">PRO</div>
-              <div class="price-limit">500 accounts</div>
-              <div class="price-amt">$249.99</div>
-              <div class="price-php">≈ ₱14,124</div>
-              <div class="price-dur">30 days</div>
-            </div>
-            <div class="price-card">
-              <div class="price-name">UNLIMITED</div>
-              <div class="price-limit">no limit</div>
-              <div class="price-amt">$399.99</div>
-              <div class="price-php">≈ ₱22,599</div>
-              <div class="price-dur">60 days</div>
-            </div>
+            <div class="price-card"><div class="price-name">BASIC</div><div class="price-limit">100 accounts</div><div class="price-amt">$59.99</div><div class="price-php">≈ ₱3,389</div><div class="price-dur">30 days</div></div>
+            <div class="price-card featured"><div class="price-name">PRO</div><div class="price-limit">500 accounts</div><div class="price-amt">$249.99</div><div class="price-php">≈ ₱14,124</div><div class="price-dur">30 days</div></div>
+            <div class="price-card"><div class="price-name">UNLIMITED</div><div class="price-limit">no limit</div><div class="price-amt">$399.99</div><div class="price-php">≈ ₱22,599</div><div class="price-dur">60 days</div></div>
           </div>
           <div class="discord-section">
             <div class="discord-label">join our server to purchase</div>
@@ -680,7 +934,7 @@ function showLicenseScreen() {
 
         <div class="lic-footer">
           <span><span class="lic-dot" id="connDot"></span>kuni tool</span>
-          <span>v2.4</span>
+          <span>v2.5</span>
         </div>
       </div>
     </div>`;
@@ -698,10 +952,12 @@ async function doLogin() {
   dot && dot.classList.add('active');
   try {
     const hwid = await getDeviceFingerprint();
-    const res  = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key, hwid})});
+    const ls_token = getLsToken();
+    const res  = await fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key, hwid, ls_token})});
     const data = await res.json();
     if (data.valid) {
       localStorage.setItem('license', key);
+      if (data.ls_token) localStorage.setItem('_kuni_lst', data.ls_token);
       licenseInfo = data;
       err.style.color='#00e87a'; err.textContent='license valid — loading...';
       setTimeout(showMainApp, 600);
@@ -718,6 +974,8 @@ async function doLogin() {
 }
 
 // ── MAIN APP ─────────────────────────────────────────────────────────────────
+let webhookSet = false;
+
 function showMainApp() {
   const planLabel = licenseInfo ? licenseInfo.plan : '—';
   const isUnlimited = licenseInfo && licenseInfo.limit >= 9999;
@@ -728,13 +986,21 @@ function showMainApp() {
         <div><div class="hdr-logo">KUNI</div><div class="hdr-sub">AUTO SB GEN</div></div>
         <div class="hdr-right">
           <span class="plan-badge" id="planBadge">${planLabel}</span>${licenseInfo && licenseInfo.is_trial ? '<span class="trial-badge">TRIAL</span>' : ''}
-          <div class="hdr-ver">v2.4</div>
+          <div class="hdr-ver">v2.5</div>
         </div>
       </div>
 
       <div class="status-bar idle" id="statusBar">
         <span class="dot"></span>
         <span class="status-text" id="statusText">idle — ready</span>
+      </div>
+
+      <!-- webhook required warning -->
+      <div class="warn-banner" id="webhookWarn">
+        <span class="warn-icon">⚠</span>
+        <div>
+          <strong>Discord webhook required.</strong> Set your webhook below before running the generator — accounts cannot be delivered without it.
+        </div>
       </div>
 
       <div class="stats">
@@ -752,7 +1018,6 @@ function showMainApp() {
 
       <div class="limit-banner" id="limitBanner">⚠ Account limit reached — contact Kuni to upgrade your plan.</div>
 
-      <!-- CONFIG -->
       <div class="config-card">
         <div class="config-card-hdr" onclick="toggleConfig()">
           <span>CONFIG</span>
@@ -764,7 +1029,6 @@ function showMainApp() {
             <div class="config-field"><span class="config-label">CONCURRENT</span><input class="config-input" type="number" id="concurrent" value="10" min="1" max="50"></div>
           </div>
 
-          <!-- proxies -->
           <div class="panel-wrap">
             <div class="panel-label" onclick="togglePanel('proxyPanel')">
               <span>PROXIES</span>
@@ -779,14 +1043,15 @@ function showMainApp() {
             </div>
           </div>
 
-          <!-- webhook -->
-          <div class="webhook-wrap">
+          <!-- webhook REQUIRED -->
+          <div class="webhook-wrap" id="webhookWrap">
             <div class="webhook-row">
-              <span class="webhook-lbl">WEBHOOK</span>
+              <span class="webhook-lbl">WEBHOOK <span id="webhookReqMark" style="color:var(--red)">*</span></span>
               <input class="webhook-input" id="webhookInput" type="text" placeholder="https://discord.com/api/webhooks/...">
             </div>
+            <div class="webhook-req-note">Required — test ping sent on save to verify the URL works.</div>
             <div class="panel-actions">
-              <button class="panel-btn" onclick="saveWebhook()">SAVE</button>
+              <button class="panel-btn" onclick="saveWebhook()">SAVE &amp; TEST</button>
               <span class="panel-status" id="webhookSt"></span>
             </div>
           </div>
@@ -795,7 +1060,6 @@ function showMainApp() {
 
       <button class="run-btn idle" id="mainBtn" onclick="toggle()">Run Generator</button>
 
-      <!-- TUTORIAL -->
       <div class="tutorial-card">
         <div class="tutorial-hdr" onclick="toggleTutorial()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
@@ -804,9 +1068,7 @@ function showMainApp() {
         </div>
         <div class="tutorial-body" id="tutBody">
           <div class="video-container">
-            <iframe src="https://drive.google.com/file/d/1KgpnvPBwSzS75rAcTzDo8MIunPc9RVtM/preview" class="video-el" frameborder="0" allowfullscreen
-              allow="autoplay" style="position:absolute;inset:0;width:100%;height:100%;border:none;"
-              sandbox="allow-scripts allow-same-origin allow-presentation"></iframe>
+            <iframe src="https://drive.google.com/file/d/1KgpnvPBwSzS75rAcTzDo8MIunPc9RVtM/preview" class="video-el" frameborder="0" allowfullscreen allow="autoplay" sandbox="allow-scripts allow-same-origin allow-presentation"></iframe>
           </div>
         </div>
       </div>
@@ -827,7 +1089,6 @@ function showMainApp() {
   initSocket();
 }
 
-// ── UI helpers ───────────────────────────────────────────────────────────────
 let cfgOpen = true;
 function toggleConfig() {
   cfgOpen = !cfgOpen;
@@ -847,8 +1108,27 @@ function toggleTutorial() {
   document.getElementById('tutToggle').textContent = tutOpen ? '▲ HIDE' : '▼ SHOW';
 }
 
+function updateWebhookUI(hasWebhook) {
+  webhookSet = hasWebhook;
+  const wrap = document.getElementById('webhookWrap');
+  const warn = document.getElementById('webhookWarn');
+  const mark = document.getElementById('webhookReqMark');
+  if (!wrap || !warn) return;
+  if (hasWebhook) {
+    wrap.classList.remove('required');
+    warn.classList.remove('show');
+    if (mark) mark.style.display = 'none';
+  } else {
+    wrap.classList.add('required');
+    warn.classList.add('show');
+    if (mark) mark.style.display = 'inline';
+    // auto-open panel to draw attention
+    const proxy = document.getElementById('proxyPanel');
+    if (proxy) proxy.classList.remove('open');
+  }
+}
+
 async function loadSavedConfig() {
-  // Load proxies count only - never show actual proxy content
   try {
     const r = await fetch('/get-proxies');
     const d = await r.json();
@@ -858,13 +1138,18 @@ async function loadSavedConfig() {
       badge.className = 'badge' + (d.count > 0 ? ' ok' : '');
     }
   } catch {}
-  // Load webhook status only - never show actual URL
   try {
     const r = await fetch('/get-webhook');
     const d = await r.json();
-    if (d.ok && d.has_webhook) {
-      const st = document.getElementById('webhookSt');
-      if (st) { st.style.color='var(--green)'; st.textContent='webhook set ✓'; }
+    if (d.ok) {
+      updateWebhookUI(d.has_webhook);
+      if (d.has_webhook) {
+        const st = document.getElementById('webhookSt');
+        if (st) { st.style.color='var(--green)'; st.textContent='webhook set ✓'; }
+      } else {
+        const st = document.getElementById('webhookSt');
+        if (st) { st.style.color='var(--red)'; st.textContent='not set — REQUIRED'; }
+      }
     }
   } catch {}
 }
@@ -878,10 +1163,10 @@ async function saveProxies() {
     const d = await r.json();
     if (d.ok) {
       st.style.color='var(--green)'; st.textContent=d.count+' proxies saved ✓';
-      document.getElementById('proxyTA').value = ''; // clear after save — never store visible
+      document.getElementById('proxyTA').value = '';
       const badge = document.getElementById('proxyBadge');
       badge.textContent = d.count+' loaded'; badge.className='badge'+(d.count>0?' ok':'');
-      setTimeout(() => togglePanel('proxyPanel'), 800); // auto-close panel after save
+      setTimeout(() => togglePanel('proxyPanel'), 800);
     } else { st.style.color='var(--red)'; st.textContent=d.error||'error'; }
   } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
@@ -889,19 +1174,30 @@ async function saveProxies() {
 async function saveWebhook() {
   const wh = document.getElementById('webhookInput').value.trim();
   const st = document.getElementById('webhookSt');
-  st.style.color='var(--muted)'; st.textContent='saving...';
+  st.style.color='var(--muted)'; st.textContent = wh ? 'testing webhook...' : 'clearing...';
   try {
     const r = await fetch('/set-webhook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webhook:wh})});
     const d = await r.json();
-    if (d.ok) { st.style.color='var(--green)'; st.textContent=wh?'webhook set ✓':'cleared'; }
-    else { st.style.color='var(--red)'; st.textContent=d.error==='invalid_webhook'?'invalid discord url':(d.error||'error'); }
+    if (d.ok) {
+      if (wh) {
+        st.style.color='var(--green)';
+        st.textContent = d.tested ? 'webhook verified ✓ — test message sent' : 'webhook saved ✓';
+        updateWebhookUI(true);
+      } else {
+        st.style.color='var(--gold)'; st.textContent='cleared';
+        updateWebhookUI(false);
+      }
+    } else {
+      st.style.color='var(--red)';
+      st.textContent = d.error === 'invalid_webhook' ? 'invalid discord url' :
+                       d.error === 'webhook_unreachable' ? 'webhook test failed — check url' :
+                       (d.error || 'error');
+    }
   } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
 
 function updateLimitBar() {
   if (!licenseInfo || licenseInfo.limit >= 9999) return;
-  const wrap = document.getElementById('limitBarWrap') || document.querySelector('.limit-bar-wrap');
-  if (!wrap) return;
   const used  = licenseInfo.limit - (licenseInfo.accounts_left ?? 0);
   const limit = licenseInfo.limit;
   const pct   = Math.min(100, Math.round(used/limit*100));
@@ -928,18 +1224,33 @@ function clearLog() { const b=document.getElementById('logBox'); if(b) b.innerHT
 
 function doLogout() { localStorage.removeItem('license'); location.reload(); }
 
-// ── Socket ───────────────────────────────────────────────────────────────────
 function initSocket() {
   const socket = io();
   let running = false;
 
   window.toggle = function() {
-    if (running) { socket.emit('stop'); }
-    else {
-      const count=parseInt(document.getElementById('count').value)||10;
-      const concurrent=parseInt(document.getElementById('concurrent').value)||10;
-      socket.emit('start',{count,concurrent});
+    if (running) { socket.emit('stop'); return; }
+
+    // client-side precheck — block if no webhook
+    if (!webhookSet) {
+      setStatus('stopped', 'webhook required — set it first');
+      const warn = document.getElementById('webhookWarn');
+      if (warn) {
+        warn.classList.add('show');
+        warn.scrollIntoView({behavior:'smooth', block:'center'});
+      }
+      // open config + flash webhook field
+      cfgOpen = true;
+      document.getElementById('cfgBody').style.display = 'flex';
+      document.getElementById('cfgToggle').textContent = '▲ HIDE';
+      const input = document.getElementById('webhookInput');
+      if (input) input.focus();
+      return;
     }
+
+    const count=parseInt(document.getElementById('count').value)||10;
+    const concurrent=parseInt(document.getElementById('concurrent').value)||10;
+    socket.emit('start',{count,concurrent});
   };
 
   socket.on('started', d => {
@@ -947,6 +1258,16 @@ function initSocket() {
     const btn=document.getElementById('mainBtn');
     btn.className='run-btn stop'; btn.textContent='■  Stop';
     setStatus('running','running — '+d.count+' accounts');
+  });
+
+  socket.on('start_blocked', d => {
+    running=false;
+    setStatus('stopped', d.message || 'blocked');
+    if (d.reason === 'webhook_required') {
+      updateWebhookUI(false);
+      const warn = document.getElementById('webhookWarn');
+      if (warn) warn.scrollIntoView({behavior:'smooth', block:'center'});
+    }
   });
 
   socket.on('stopped', () => {
@@ -968,7 +1289,6 @@ function initSocket() {
     document.getElementById('s-active').textContent=d.active;
     document.getElementById('s-failed').textContent=d.failed;
     document.getElementById('s-target').textContent=d.target;
-    // Update limit bar realtime
     if (licenseInfo && licenseInfo.limit < 9999) {
       const used = (licenseInfo.used||0) + d.created;
       const pct  = Math.min(100, Math.round(used/licenseInfo.limit*100));
@@ -999,13 +1319,14 @@ function initSocket() {
 const savedKey = localStorage.getItem('license');
 if (savedKey) {
   getDeviceFingerprint().then(hwid => {
-  fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:savedKey, hwid})})
-    .then(r=>r.json())
-    .then(data => {
-      if (data.valid) { licenseInfo=data; showMainApp(); }
-      else { localStorage.removeItem('license'); showLicenseScreen(); }
-    })
-    .catch(() => showLicenseScreen());
+    const ls_token = getLsToken();
+    fetch('/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:savedKey, hwid, ls_token})})
+      .then(r=>r.json())
+      .then(data => {
+        if (data.valid) { licenseInfo=data; showMainApp(); }
+        else { localStorage.removeItem('license'); showLicenseScreen(); }
+      })
+      .catch(() => showLicenseScreen());
   });
 } else {
   showLicenseScreen();
@@ -1015,56 +1336,11 @@ if (savedKey) {
 </html>
 """
 
-
-@app.route("/claim-trial", methods=["POST"])
-def claim_trial():
-    try:
-        # Use client-sent device fingerprint if provided, fallback to IP
-        client_hwid = (request.json or {}).get("hwid", "").strip()
-        hwid = client_hwid if client_hwid else get_hwid(request.remote_addr)
-
-        # Check if this HWID already has a trial
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=supa_hdrs(),
-                         params={"hwid": f"eq.{hwid}", "is_trial": "eq.true", "select": "id,license_key"})
-        if r.status_code == 200 and r.json():
-            existing = r.json()[0]
-            return jsonify({"ok": False, "error": "already_claimed",
-                            "key": existing["license_key"]})
-
-        # Generate trial key
-        def seg(): return __import__('random').choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6)
-        key = "TRIAL-" + "".join(seg()) + "-" + "".join(seg()) + "-" + "".join(seg())
-
-        # 30 day expiry
-        from datetime import timedelta
-        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-
-        body = {
-            "license_key":    key,
-            "accounts_limit": 1,
-            "accounts_used":  0,
-            "expiry_date":    expiry,
-            "status":         "active",
-            "is_trial":       True,
-            "hwid":           hwid,   # bind HWID immediately
-            "note":           "free trial",
-        }
-        r2 = requests.post(f"{SUPABASE_URL}/rest/v1/licenses",
-                           headers={**supa_hdrs(), "Prefer": "return=representation"},
-                           json=body)
-        if r2.status_code not in (200, 201):
-            return jsonify({"ok": False, "error": "db_error"})
-
-        return jsonify({"ok": True, "key": key})
-    except Exception as e:
-        print("TRIAL ERROR:", e)
-        return jsonify({"ok": False, "error": "server_error"})
-
 @app.route("/")
 def index():
     return HTML
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n[KUNI] v2.4 running on http://localhost:{port}\n")
+    print(f"\n[KUNI] v2.5 running on http://localhost:{port}\n")
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
