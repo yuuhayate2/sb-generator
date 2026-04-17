@@ -80,18 +80,20 @@ def save_user_webhook(license_key, wh):
     user_webhook_path(license_key).write_text(wh or "")
 
 def load_user_proxies(license_key):
-    # ── Priority 1: Proxies from UI (per-user file) ──
+    
     p = user_proxies_path(license_key)
     if p.exists():
-        proxies = [l.strip() for l in p.read_text().splitlines() 
+        proxies = [l.strip() for l in p.read_text().splitlines()
                    if l.strip() and not l.startswith("#")]
         if proxies:
+            print(f"[PROXIES] Loaded {len(proxies)} proxies from user file")
             return proxies
 
+ 
     global_proxy_file = Path(__file__).parent / "proxies.txt"
     if global_proxy_file.exists():
         try:
-            proxies = [l.strip() for l in global_proxy_file.read_text().splitlines() 
+            proxies = [l.strip() for l in global_proxy_file.read_text().splitlines()
                        if l.strip() and not l.startswith("#")]
             if proxies:
                 print(f"[PROXIES] Loaded {len(proxies)} proxies from proxies.txt")
@@ -99,10 +101,9 @@ def load_user_proxies(license_key):
         except Exception as e:
             print(f"[PROXIES] Error reading proxies.txt: {e}")
 
-    
-    print("[PROXIES] No proxies found in UI or proxies.txt")
-    return []
 
+    print("[PROXIES] No proxies found in UI or proxies.txt - running without proxy")
+    return []
 def save_user_proxies(license_key, lines):
     user_proxies_path(license_key).write_text("\n".join(lines))
 
