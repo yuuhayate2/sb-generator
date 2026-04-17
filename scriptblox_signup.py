@@ -1,18 +1,4 @@
-# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.6
-# Deploy on Railway / Render — open http://localhost:5000
-#
-# v2.6 changelog:
-#   • Multi-user session isolation (per-license state, webhook, proxies)
-#   • Rate limiting on /verify-key and /claim-trial
-#   • Email domain masking in Discord webhook (privacy)
-#   • Enhanced fingerprinting: canvas + audio + WebGL + fonts
-#   • Datacenter/VPN IP detection for trial abuse
-#   • Server-side UA consistency verification
-#   • Atomic counter with TOCTOU-safe retry loop
-#   • JWT exp parsing → accurate cookie expiry
-#   • SocketIO auth middleware (all events require valid session)
-#   • Subnet-level trial blocking (/16 + /24)
-#   • Live license re-check before every batch start
+
 
 import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
