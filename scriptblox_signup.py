@@ -1,18 +1,3 @@
-# scriptblox_signup.py — Kuni Tool · SB Account Generator v2.6
-# Deploy on Railway / Render — open http://localhost:5000
-#
-# v2.6 changelog:
-#   • Multi-user session isolation (per-license state, webhook, proxies)
-#   • Rate limiting on /verify-key
-#   • Email domain masking in Discord webhook (privacy)
-#   • Enhanced fingerprinting: canvas + audio + WebGL + fonts
-#   • Datacenter/VPN IP detection for trial abuse
-#   • Server-side UA consistency verification
-#   • Atomic counter with TOCTOU-safe retry loop
-#   • JWT exp parsing → accurate cookie expiry
-#   • SocketIO auth middleware (all events require valid session)
-#   • Subnet-level trial blocking (/16 + /24)
-#   • Live license re-check before every batch start
 
 import json, os, random, re, string, threading, hashlib, secrets, time, base64
 from collections import defaultdict, deque
@@ -1907,20 +1892,20 @@ function showLicenseScreen() {
     <div class="lic-wrap animate-in">
       <div class="lic-card">
         <div class="lic-brand">
-          <div class="lic-icon">🚀</div>
+          <div class="lic-icon"></div>
           <div class="lic-logo">KUNI</div>
         </div>
         <div class="lic-sub">Auto SB Gen &nbsp;·&nbsp; v2.6</div>
 
-        <span class="lic-label">🔑 LICENSE KEY</span>
+        <span class="lic-label">LICENSE KEY</span>
         <input class="lic-input" id="licInput" type="text" placeholder="KUNI-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
         <button class="lic-btn" id="licBtn" onclick="doLogin()">
-          <span>⚡</span> Verify License
+          <span></span> Verify License
         </button>
         <div class="lic-err" id="licErr"></div>
 
         <div class="price-section">
-          <div class="price-title">💎 Pricing Plans</div>
+          <div class="price-title">Pricing Plans</div>
           <div class="price-grid">
             <div class="price-card">
               <div class="price-name">BASIC</div>
@@ -1943,7 +1928,7 @@ function showLicenseScreen() {
             </div>
           </div>
           <div class="discord-section">
-            <div class="discord-label">🎮 join our server to purchase</div>
+            <div class="discord-label">join our server to purchase</div>
             <a class="discord-btn" href="https://discord.gg/Qvy4BSGJvC" target="_blank">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03z"/></svg>
               Join <strong style="color:#fff">Kuni Server</strong>
@@ -1965,8 +1950,8 @@ async function doLogin() {
   const err = document.getElementById('licErr');
   const btn = document.getElementById('licBtn');
   if (!key) { err.style.color='var(--gold)'; err.textContent='⚠ please enter a license key'; return; }
-  btn.classList.add('loading'); btn.textContent = '⏳ Verifying...';
-  err.style.color='var(--text2)'; err.textContent='🔄 connecting...';
+  btn.classList.add('loading'); btn.textContent = 'Verifying...';
+  err.style.color='var(--text2)'; err.textContent='connecting...';
   try {
     const [hwid, fp] = await Promise.all([getDeviceFingerprint(), getExtraFp()]);
     const ls_token = getLsToken();
@@ -1978,15 +1963,15 @@ async function doLogin() {
       localStorage.setItem('session_token', sessionToken);
       if (data.ls_token) localStorage.setItem('_kuni_lst', data.ls_token);
       licenseInfo = data;
-      err.style.color='var(--green)'; err.textContent='✅ license valid — loading...';
+      err.style.color='var(--green)'; err.textContent='license valid — loading...';
       setTimeout(showMainApp, 600);
     } else {
-      btn.classList.remove('loading'); btn.innerHTML='<span>⚡</span> Verify License';
-      err.style.color='var(--red)'; err.textContent = '❌ '+(ERR_MAP[data.error] || 'invalid license — contact kuni');
+      btn.classList.remove('loading'); btn.innerHTML='<span></span> Verify License';
+      err.style.color='var(--red)'; err.textContent = ''+(ERR_MAP[data.error] || 'invalid license — contact kuni');
     }
   } catch {
-    btn.classList.remove('loading'); btn.innerHTML='<span>⚡</span> Verify License';
-    err.style.color='var(--red)'; err.textContent='❌ server error';
+    btn.classList.remove('loading'); btn.innerHTML='<span></span> Verify License';
+    err.style.color='var(--red)'; err.textContent='server error';
   }
 }
 
@@ -1999,13 +1984,13 @@ function showMainApp() {
     <div class="app animate-in">
       <!-- Header -->
       <div class="hdr">
-        <div class="hdr-icon">🚀</div>
+        <div class="hdr-icon"></div>
         <div>
           <div class="hdr-logo">KUNI</div>
           <div class="hdr-sub">AUTO SB GEN · SCRIPTBLOX</div>
         </div>
         <div class="hdr-right">
-          <span class="plan-badge" id="planBadge">💎 ${planLabel}</span>
+          <span class="plan-badge" id="planBadge">${planLabel}</span>
           <div class="ver-badge">v2.6</div>
         </div>
       </div>
@@ -2013,38 +1998,38 @@ function showMainApp() {
       <!-- Status -->
       <div class="status-bar idle" id="statusBar">
         <span class="s-dot"></span>
-        <span class="s-text" id="statusText">💤 idle — ready to generate</span>
-        <span class="s-icon" id="statusIcon">⬛</span>
+        <span class="s-text" id="statusText">idle — ready to generate</span>
+        <span class="s-icon" id="statusIcon"></span>
       </div>
 
       <!-- Webhook warning -->
       <div class="warn-banner" id="webhookWarn">
-        <span class="warn-icon">⚠️</span>
+        <span class="warn-icon"></span>
         <div><strong>Discord webhook required.</strong> Set your webhook below before running the generator.</div>
       </div>
 
       <!-- Stats -->
       <div class="stats">
         <div class="stat s-created">
-          <span class="stat-icon">✅</span>
+          <span class="stat-icon"></span>
           <span class="stat-val" id="s-created">0</span>
           <span class="stat-lbl">Created</span>
           <div class="stat-bar"></div>
         </div>
         <div class="stat s-active">
-          <span class="stat-icon">⚡</span>
+          <span class="stat-icon"></span>
           <span class="stat-val" id="s-active">0</span>
           <span class="stat-lbl">Active</span>
           <div class="stat-bar"></div>
         </div>
         <div class="stat s-failed">
-          <span class="stat-icon">❌</span>
+          <span class="stat-icon"></span>
           <span class="stat-val" id="s-failed">0</span>
           <span class="stat-lbl">Failed</span>
           <div class="stat-bar"></div>
         </div>
         <div class="stat s-target">
-          <span class="stat-icon">🎯</span>
+          <span class="stat-icon"></span>
           <span class="stat-val" id="s-target">0</span>
           <span class="stat-lbl">Target</span>
           <div class="stat-bar"></div>
@@ -2055,7 +2040,7 @@ function showMainApp() {
       ${!isUnlimited ? `
       <div class="limit-bar-wrap">
         <div class="limit-bar-top">
-          <span class="lbl">📊 Account Usage</span>
+          <span class="lbl">Account Usage</span>
           <span id="limitText" style="color:var(--text)">loading...</span>
         </div>
         <div class="limit-bar-track"><div class="limit-bar-fill" id="limitBar" style="width:0%"></div></div>
@@ -2063,14 +2048,14 @@ function showMainApp() {
 
       <!-- Limit banner -->
       <div class="limit-banner" id="limitBanner">
-        <span>🚫</span>
+        <span></span>
         <span>Account limit reached — contact Kuni to upgrade your plan.</span>
       </div>
 
       <!-- Config -->
       <div class="config-card">
         <div class="config-hdr" onclick="toggleConfig()">
-          <span class="config-hdr-icon">⚙️</span>
+          <span class="config-hdr-icon"></span>
           <span>Configuration</span>
           <span class="config-toggle" id="cfgToggle">HIDE</span>
         </div>
@@ -2079,11 +2064,11 @@ function showMainApp() {
           <!-- Count + Concurrent -->
           <div class="config-row">
             <div class="config-field">
-              <span class="config-label">📦 Count</span>
+              <span class="config-label">Count</span>
               <input class="config-input" type="number" id="count" value="10" min="1" max="9999">
             </div>
             <div class="config-field">
-              <span class="config-label">🔀 Concurrent</span>
+              <span class="config-label">Concurrent</span>
               <input class="config-input" type="number" id="concurrent" value="10" min="1" max="50">
             </div>
           </div>
@@ -2091,7 +2076,7 @@ function showMainApp() {
           <!-- Proxies -->
           <div class="panel-wrap">
             <div class="panel-label" onclick="togglePanel('proxyPanel')">
-              <span class="panel-label-icon">🌐</span>
+              <span class="panel-label-icon"></span>
               <span>Proxies (rotating)</span>
               <span class="panel-badge" id="proxyBadge">loading...</span>
             </div>
@@ -2102,7 +2087,7 @@ function showMainApp() {
                 <span id="proxyStripTxt">no proxies loaded</span>
               </div>
               <div class="panel-actions">
-                <button class="panel-btn" onclick="saveProxies()">💾 Save Proxies</button>
+                <button class="panel-btn" onclick="saveProxies()">Save Proxies</button>
                 <span class="panel-status" id="proxySt"></span>
               </div>
             </div>
@@ -2127,13 +2112,13 @@ function showMainApp() {
 
       <!-- Run Button -->
       <button class="run-btn idle" id="mainBtn" onclick="toggle()">
-        <span>🚀</span> Run Generator
+        <span></span> Run Generator
       </button>
 
       <!-- Tutorial -->
       <div class="tutorial-card">
         <div class="tutorial-hdr" onclick="toggleTutorial()">
-          <span class="tutorial-hdr-icon">🎬</span>
+          <span class="tutorial-hdr-icon"></span>
           <span>How to use your accounts</span>
           <span id="tutToggle" style="margin-left:auto;font-size:9px;letter-spacing:2px;color:var(--text3)">SHOW</span>
         </div>
@@ -2147,7 +2132,7 @@ function showMainApp() {
       <!-- Log -->
       <div class="log-wrap">
         <div class="log-header">
-          <span class="log-header-icon">📋</span>
+          <span class="log-header-icon"></span>
           <span>Log Output</span>
           <button class="log-clear" onclick="clearLog()">🗑 clear</button>
         </div>
@@ -2156,8 +2141,8 @@ function showMainApp() {
 
       <!-- Footer -->
       <div class="footer">
-        <span>🔐 kuni tool · v2.6</span>
-        <a href="#" onclick="doLogout();return false;">🚪 logout</a>
+        <span>kuni tool · v2.6</span>
+        <a href="#" onclick="doLogout();return false;">logout</a>
       </div>
     </div>`;
 
@@ -2219,8 +2204,8 @@ async function loadSavedConfig() {
       updateWebhookUI(d.has_webhook);
       const st = document.getElementById('webhookSt');
       if (st) {
-        if (d.has_webhook) { st.style.color='var(--green)'; st.textContent='✅ connected'; }
-        else { st.style.color='var(--red)'; st.textContent='❌ not set'; }
+        if (d.has_webhook) { st.style.color='var(--green)'; st.textContent='connected'; }
+        else { st.style.color='var(--red)'; st.textContent='not set'; }
       }
     }
   } catch {}
@@ -2229,39 +2214,39 @@ async function loadSavedConfig() {
 async function saveProxies() {
   const text = document.getElementById('proxyTA').value;
   const st = document.getElementById('proxySt');
-  st.style.color='var(--text2)'; st.textContent='⏳ saving...';
+  st.style.color='var(--text2)'; st.textContent='saving...';
   try {
     const r = await authFetch('/set-proxies',{method:'POST',body:JSON.stringify({proxies:text})});
     const d = await r.json();
     if (d.ok) {
-      st.style.color='var(--green)'; st.textContent='✅ '+d.count+' proxies saved';
+      st.style.color='var(--green)'; st.textContent=''+d.count+' proxies saved';
       document.getElementById('proxyTA').value='';
       const b = document.getElementById('proxyBadge');
       b.textContent=d.count+' loaded'; b.className='panel-badge'+(d.count>0?' ok':'');
       updateProxyStrip(d.count);
       setTimeout(()=>togglePanel('proxyPanel'), 900);
-    } else { st.style.color='var(--red)'; st.textContent='❌ '+(d.error||'error'); }
-  } catch { st.style.color='var(--red)'; st.textContent='❌ request failed'; }
+    } else { st.style.color='var(--red)'; st.textContent=''+(d.error||'error'); }
+  } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
 
 async function saveWebhook() {
   const wh = document.getElementById('webhookInput').value.trim();
   const st = document.getElementById('webhookSt');
-  st.style.color='var(--text2)'; st.textContent = wh?'⏳ testing...':'⏳ clearing...';
+  st.style.color='var(--text2)'; st.textContent = wh?'testing...':'clearing...';
   try {
     const r = await authFetch('/set-webhook',{method:'POST',body:JSON.stringify({webhook:wh})});
     const d = await r.json();
     if (d.ok) {
-      if (wh) { st.style.color='var(--green)'; st.textContent = d.tested?'✅ verified — test sent':'✅ saved'; updateWebhookUI(true); }
+      if (wh) { st.style.color='var(--green)'; st.textContent = d.tested?'verified — test sent':'saved'; updateWebhookUI(true); }
       else { st.style.color='var(--gold)'; st.textContent='🗑 cleared'; updateWebhookUI(false); }
     } else {
       st.style.color='var(--red)';
-      st.textContent = d.error==='invalid_webhook'?'❌ invalid discord url':
-                       d.error==='webhook_unreachable'?'❌ test failed — check url':
-                       d.error==='not_authenticated'?'❌ session expired — refresh':
-                       ('❌ '+(d.error||'error'));
+      st.textContent = d.error==='invalid_webhook'?'invalid discord url':
+                       d.error==='webhook_unreachable'?'test failed — check url':
+                       d.error==='not_authenticated'?'session expired — refresh':
+                       (''+(d.error||'error'));
     }
-  } catch { st.style.color='var(--red)'; st.textContent='❌ request failed'; }
+  } catch { st.style.color='var(--red)'; st.textContent='request failed'; }
 }
 
 function updateLimitBar() {
@@ -2279,11 +2264,11 @@ function showLimitReached(used, limit, reason) {
   const banner = document.getElementById('limitBanner');
   if (banner) {
     banner.classList.add('show');
-    banner.innerHTML = '<span>🚫</span><span>'+(reason==='revoked'?'License revoked — contact Kuni':reason==='expired'?'License expired — contact Kuni':'Account limit reached — upgrade to continue.')+'</span>';
+    banner.innerHTML = '<span></span><span>'+(reason==='revoked'?'License revoked — contact Kuni':reason==='expired'?'License expired — contact Kuni':'Account limit reached — upgrade to continue.')+'</span>';
   }
   const btn = document.getElementById('mainBtn');
-  if (btn) { btn.className='run-btn disabled-btn'; btn.innerHTML='<span>🔒</span> Unavailable'; }
-  setStatus('limit', '🚫 '+(reason||'limit reached')+' — '+used+'/'+limit);
+  if (btn) { btn.className='run-btn disabled-btn'; btn.innerHTML='<span></span> Unavailable'; }
+  setStatus('limit', ''+(reason||'limit reached')+' — '+used+'/'+limit);
 }
 
 function setStatus(mode, text) {
@@ -2318,7 +2303,7 @@ function initSocket() {
   window.toggle = function() {
     if (running) { socket.emit('stop'); return; }
     if (!webhookSet) {
-      setStatus('stopped', '⚠️ webhook required — set it first');
+      setStatus('stopped', 'webhook required — set it first');
       const warn = document.getElementById('webhookWarn');
       if (warn) { warn.classList.add('show'); warn.scrollIntoView({behavior:'smooth',block:'center'}); }
       cfgOpen = true;
@@ -2337,12 +2322,12 @@ function initSocket() {
     running = true;
     const btn = document.getElementById('mainBtn');
     btn.className='run-btn stop'; btn.innerHTML='<span>⏹</span> Stop Generator';
-    setStatus('running','⚡ running — generating '+d.count+' accounts');
+    setStatus('running','running — generating '+d.count+' accounts');
   });
 
   socket.on('start_blocked', d => {
     running = false;
-    setStatus('stopped', '🚫 '+(d.message||'blocked'));
+    setStatus('stopped', ''+(d.message||'blocked'));
     if (d.reason==='webhook_required') {
       updateWebhookUI(false);
       const warn = document.getElementById('webhookWarn');
@@ -2353,15 +2338,15 @@ function initSocket() {
   socket.on('stopped', () => {
     running = false;
     const btn = document.getElementById('mainBtn');
-    btn.className='run-btn idle'; btn.innerHTML='<span>🚀</span> Run Generator';
+    btn.className='run-btn idle'; btn.innerHTML='<span></span> Run Generator';
     setStatus('stopped','⏹ stopped by user');
   });
 
   socket.on('done', d => {
     running = false;
     const btn = document.getElementById('mainBtn');
-    btn.className='run-btn idle'; btn.innerHTML='<span>🚀</span> Run Generator';
-    setStatus('done','✅ done — '+d.created+'/'+d.total+' accounts created');
+    btn.className='run-btn idle'; btn.innerHTML='<span></span> Run Generator';
+    setStatus('done','done — '+d.created+'/'+d.total+' accounts created');
   });
 
   socket.on('stats', d => {
@@ -2383,7 +2368,7 @@ function initSocket() {
     const box=document.getElementById('logBox');
     if (!box) return;
     const line=document.createElement('div');
-    const tag = {ok:'✅',err:'❌',dim:'·',inf:'ℹ'}[d.tag||'dim'] || '·';
+    const tag = {ok:'',err:'',dim:'·',inf:'ℹ'}[d.tag||'dim'] || '·';
     line.className='log-line '+(d.tag||'dim');
     const msg=d.msg||'';
     const m=msg.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*(.*)/s);
