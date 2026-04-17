@@ -693,7 +693,8 @@ def create_account(sess_token, slot):
         resp = r.json() if r.content else {}
         # Debug: log response structure so we can see where token lives
         resp_keys = list(resp.keys()) if isinstance(resp, dict) else str(type(resp))
-        print(f"[signup #{slot}] status={r.status_code} keys={resp_keys} set-cookie={r.headers.get('set-cookie','')[:120]}")
+        resp_msg = str(resp.get("message",""))[:150] if isinstance(resp, dict) else ""
+        print(f"[signup #{slot}] status={r.status_code} keys={resp_keys} msg={resp_msg} set-cookie={r.headers.get('set-cookie','')[:120]}")
         # Try multiple locations for token
         signup_token = resp.get("token") or resp.get("accessToken") or ""
         if not signup_token and isinstance(resp.get("data"), dict):
@@ -705,9 +706,10 @@ def create_account(sess_token, slot):
         log_emit(sess_token, f"[#{slot}] x request error: {str(e)[:50]}", "err")
         return
 
-    if resp.get("error") or (isinstance(resp.get("statusCode"), int) and resp["statusCode"] >= 400):
+    if r.status_code >= 400 or resp.get("error") or (isinstance(resp.get("statusCode"), int) and resp["statusCode"] >= 400):
         state["failed"] += 1
-        log_emit(sess_token, f"[#{slot}] x signup failed: {resp.get('message','')}", "err")
+        err_msg = resp.get("message") or resp.get("error") or f"HTTP {r.status_code}"
+        log_emit(sess_token, f"[#{slot}] x signup failed ({r.status_code}): {err_msg}", "err")
         return
 
     # Grab token from Set-Cookie header (raw)
