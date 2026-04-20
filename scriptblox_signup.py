@@ -712,25 +712,25 @@ def send_webhook(webhook_url, username, password, email, cookies_url=None, cooki
         embed = {
             "author": {
                 "name": "KUNI · SB GENERATOR",
-                "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png",
+                "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png",
             },
             "title": "New Account Generated",
             "description": "A fresh ScriptBlox account is ready for use.\n───────────────────────────",
             "color": color,
             "fields": fields,
             "thumbnail": {
-                "url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png"
+                "url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png"
             },
             "footer": {
                 "text": f"Kuni Tool • {datetime.now(timezone.utc).strftime('%b %d, %Y %H:%M UTC')}",
-                "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png",
+                "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png",
             },
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         payload = {
             "username": "Kuni SB Gen",
-            "avatar_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png",
+            "avatar_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png",
             "embeds": [embed],
         }
 
@@ -760,11 +760,11 @@ def test_webhook(url):
     try:
         r = requests.post(url, json={
             "username": "Kuni SB Gen",
-            "avatar_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png",
+            "avatar_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png",
             "embeds": [{
                 "author": {
                     "name": "KUNI · SB GENERATOR",
-                    "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png",
+                    "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png",
                 },
                 "title": "✅ Webhook Connected",
                 "description": ("Your webhook is now linked to **Kuni SB Generator**.\n"
@@ -777,11 +777,11 @@ def test_webhook(url):
                     {"name": "📦 Delivery",   "value": "```\nAccount + Cookies\n```", "inline": True},
                 ],
                 "thumbnail": {
-                    "url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png"
+                    "url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png"
                 },
                 "footer": {
                     "text": f"Kuni Tool • {datetime.now(timezone.utc).strftime('%b %d, %Y %H:%M UTC')}",
-                    "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1494747738598805626/a21a22f3-ccb2-4df4-a77d-924e06fc2079.png",
+                    "icon_url": "https://cdn.discordapp.com/attachments/1485145708666552342/1495745856362516591/content.png",
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }]
