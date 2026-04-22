@@ -25,7 +25,7 @@ SB_HOME       = "https://scriptblox.com/"
 NO_PROXY      = {"http": None, "https": None}
 
 TOMY_BASE     = "https://tomy634.com"
-TOMY_API_KEY  = os.environ.get("TOMY_API_KEY", "pub2_5hza8iwgjp53tgho2tb9d4az")
+TOMY_API_KEY  = os.environ.get("TOMY_API_KEY", "YOUR_PUBLIC_KEY")
 
 USER_DATA_DIR = Path(__file__).parent / "user_data"
 USER_DATA_DIR.mkdir(exist_ok=True)
