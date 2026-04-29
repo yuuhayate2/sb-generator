@@ -207,7 +207,6 @@ def atomic_increment_used(key, limit):
 
 # ── fake.legal Temp Mail API ───────────────────────────────────────────────────
 def fakelegal_create_inbox():
-    """Create a new inbox using fake.legal API. Returns (address, address) or (None, None)."""
     try:
         domain = random.choice(FAKELEGAL_DOMAINS)
         r = requests.get(f"{FAKELEGAL_BASE}/inbox/new",
@@ -219,14 +218,12 @@ def fakelegal_create_inbox():
             if data.get("success") and data.get("address"):
                 address = data["address"]
                 print(f"[fakelegal] inbox created: {address}")
-                # address is used as both the "box_id" and email
                 return address, address
     except Exception as e:
         print(f"[fakelegal create] error: {e}")
     return None, None
 
 def fakelegal_poll_code(email_address, timeout=150, poll_interval=3):
-    """Poll fake.legal inbox for ScriptBlox verification code."""
     deadline = time.time() + timeout
     poll_count = 0
     time.sleep(3)
@@ -245,13 +242,11 @@ def fakelegal_poll_code(email_address, timeout=150, poll_interval=3):
                 subject = str(msg.get("subject") or "").lower()
                 if not ("scriptblox" in sender or "scriptblox" in subject or "verification" in subject):
                     continue
-                # Try snippet / subject first
                 blob = str(msg.get("subject") or "")
                 match = re.search(r"(?<!\d)(\d{7})(?!\d)", blob)
                 if match:
                     print(f"[fakelegal FOUND subject] code={match.group(1)}")
                     return match.group(1)
-                # Fetch full email body
                 msg_id = msg.get("id")
                 if msg_id:
                     try:
@@ -283,6 +278,7 @@ def sb_verify_account(code, token_value, proxy_r=None, visitor_id=None):
             visitor_id = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()
         hdrs = {
             "Content-Type": "application/json", "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
             "Origin": "https://scriptblox.com", "Referer": "https://scriptblox.com/verify",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143.0.0.0 Safari/537.36",
             "Authorization": token_value, "x-visitor": visitor_id,
@@ -439,12 +435,15 @@ def proxy_to_requests(proxy):
         return {"http": f"http://{user}:{pw}@{host}", "https": f"http://{user}:{pw}@{host}"}
     return {"http": server, "https": server}
 
+# ── FIXED: Added Accept-Encoding gzip, deflate to avoid brotli decode error ──
 def sb_headers():
     return {
-        "Content-Type": "application/json", "Accept": "application/json",
-        "Origin": "https://scriptblox.com", "Referer": "https://scriptblox.com/signup",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Origin": "https://scriptblox.com",
+        "Referer": "https://scriptblox.com/signup",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143.0.0.0 Safari/537.36",
-        "Accept-Encoding": "gzip, deflate",  # exclude brotli — not supported without extra package
     }
 
 def log_emit(sess_token, msg, tag="info"):
@@ -507,7 +506,6 @@ def create_account(sess_token, slot):
 
     log_emit(sess_token, f"[#{slot}] creating email + solving captcha...", "dim")
 
-    # Use fake.legal instead of tomy634
     email_addr, _ = fakelegal_create_inbox()
     captcha = solve_turnstile_capsolver()
 
@@ -520,6 +518,8 @@ def create_account(sess_token, slot):
     log_emit(sess_token, f"[#{slot}] submitting signup...", "dim")
 
     signup_token = ""
+    r = None
+    resp = {}
     try:
         signup_hdrs = sb_headers()
         signup_hdrs["x-visitor"] = visitor_id
@@ -535,7 +535,7 @@ def create_account(sess_token, slot):
         if not signup_token and isinstance(resp.get("user"), dict): signup_token = resp["user"].get("token", "")
     except Exception as e:
         state["failed"] += 1
-        log_emit(sess_token, f"[#{slot}] x request error: {str(e)[:50]}", "err")
+        log_emit(sess_token, f"[#{slot}] x request error: {str(e)[:80]}", "err")
         return
 
     if r.status_code >= 400 or resp.get("error") or (isinstance(resp.get("statusCode"), int) and resp["statusCode"] >= 400):
