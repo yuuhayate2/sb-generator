@@ -444,6 +444,7 @@ def sb_headers():
         "Content-Type": "application/json", "Accept": "application/json",
         "Origin": "https://scriptblox.com", "Referer": "https://scriptblox.com/signup",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143.0.0.0 Safari/537.36",
+        "Accept-Encoding": "gzip, deflate",  # exclude brotli — not supported without extra package
     }
 
 def log_emit(sess_token, msg, tag="info"):
